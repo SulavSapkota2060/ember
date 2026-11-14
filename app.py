@@ -23,6 +23,26 @@ with st.sidebar:
 if sel:
     st.map([{"lat": sel["lat"], "lon": sel["lon"]}], zoom=14, height=250)
 
+    with st.spinner("Loading CoStar tenancy and sale data (first load is slow)..."):
+        stk = costar.get_stakes(sel["id"])
+    st.subheader("What's at stake (CoStar)")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Current tenants", stk["tenant_count"])
+    c2.metric("Occupied sq ft", f"{stk['occupied_sqft']:,.0f}" if stk["occupied_sqft"] else "not recorded")
+    c3.metric("Employees (known)", stk["employees_known"] if stk["employees_known"] is not None else "not recorded",
+              help=f"CoStar has headcount for {stk['employees_known_for']}; the true total is higher or unknown.")
+    sale = stk["last_sale"]
+    if sale:
+        c4.metric("Last sale", f"${sale['price']:,.0f}" if sale["price"] else "price not disclosed",
+                  help=f"{sale['date']}; price status: {sale['price_status']}" + ("; portfolio sale" if sale["portfolio_sale"] else ""))
+        c4.caption(f"{sale['date']} · {sale['price_status']}" + (" · portfolio" if sale["portfolio_sale"] else ""))
+    else:
+        c4.metric("Last sale", "none in CoStar kit")
+    if stk["tenants"]:
+        st.dataframe([{"Tenant": t["name"], "Employees": t["employees"], "Sq ft": t["sqft"], "Lease expires": t["lease_expires"]}
+                      for t in stk["tenants"]], hide_index=True, use_container_width=True)
+    st.caption("Figures are as CoStar records them; blanks mean CoStar has no value, not zero.")
+
 if go:
     left, right = st.columns([1, 1])
     plan_box, log = left.empty(), left.container()

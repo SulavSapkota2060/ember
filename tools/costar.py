@@ -53,3 +53,64 @@ def get_property(building_id: int) -> dict:
             "lotSize": r.get("lotSize"), "sprinklers": r.get("hasSprinklers"),
             "construction": r.get("buildingConstructionMaterial"),
             "matterport_models": _models().get(r["id"], [])}
+
+
+# ---- stakes: who is in the building and what it is worth (CoStar) ----
+SALE_PRICE_STATUS = {0: "Unknown", 1: "Affidavit", 2: "Approximate", 3: "Confirmed", 4: "Declaration",
+                     5: "FullValue (from transfer tax, unconfirmed)", 6: "Mini", 7: "Unconfirmed", 8: "Allocated (portfolio share)"}
+
+def _jsonl(name):
+    with open(KIT_DIR / "data" / name) as f:
+        for line in f:
+            yield json.loads(line)
+
+@lru_cache(1)
+def _occupancies():
+    by = {}
+    for r in _jsonl("location-occupancy.jsonl"):
+        by.setdefault(r["propertyId"], []).append(r)
+    return by
+
+@lru_cache(1)
+def _companies():
+    return {r["id"]: r for r in _jsonl("company-detail.jsonl")}
+
+@lru_cache(1)
+def _sales():
+    by = {}
+    for r in _jsonl("commercial-sale-comp.jsonl"):
+        for e in r.get("entities") or []:
+            if e.get("propertyId"):
+                by.setdefault(e["propertyId"], []).append(r)
+    return by
+
+def get_stakes(building_id: int) -> dict:
+    """Current tenants, employees, occupied area and last sale for a building. Every figure is as CoStar
+    records it; missing values stay None (never estimated)."""
+    pid = int(building_id)
+    comps = _companies()
+    tenants, area = [], 0.0
+    for o in _occupancies().get(pid, []):
+        if o.get("toDate"):
+            continue  # null toDate = still in place
+        c = comps.get(o.get("tenantLocationId")) or {}
+        sf = sum(s.get("squareFeetOccupied") or 0 for s in o.get("spaces") or [])
+        area += sf
+        tenants.append({"name": c.get("name") or "Unknown tenant", "employees": c.get("numEmployees"),
+                        "sqft": sf or None,
+                        "lease_expires": ((o.get("leaseDeal") or {}).get("expirationDate") or "")[:10] or None})
+    tenants.sort(key=lambda t: -(t["sqft"] or 0))
+    known = [t["employees"] for t in tenants if t["employees"] is not None]
+    sale = None
+    cands = [r for r in _sales().get(pid, []) if r.get("soldDate")]
+    if cands:
+        r = max(cands, key=lambda r: r["soldDate"])
+        multi = len(r.get("entities") or []) > 1
+        sale = {"date": r["soldDate"][:10], "price": r.get("soldForPrice"),
+                "price_status": SALE_PRICE_STATUS.get(r.get("salePriceStatus"), "Unknown"),
+                "portfolio_sale": multi}
+    return {"building_id": pid, "tenant_count": len(tenants), "tenants": tenants[:8],
+            "occupied_sqft": area or None,
+            "employees_known": sum(known) if known else None,
+            "employees_known_for": f"{len(known)} of {len(tenants)} tenants",
+            "last_sale": sale}
