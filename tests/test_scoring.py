@@ -61,3 +61,14 @@ assert gi["interior"]["obs"]["blocked_egress"] == "seen"  # fixes never mutate t
 ids = {x["id"] for x in sc.rank_fixes(_with_interior(none_seen))}
 assert "add_extinguishers" in ids and "clear_egress" not in ids  # only fixes that change something
 print("interior tests passed")
+
+
+# ---- regional (CAL FIRE zone) factor ----
+def _z(zone):
+    g = dict(f); g["zone_hazard"] = zone; return g
+vh = sc.score(_z({"status": "ok", "in_zone": True, "class": "Very High", "area": "LRA (2011 map)"}))
+out = sc.score(_z({"status": "ok", "in_zone": False, "class": None, "area": None}))
+assert "regional" not in {m["factor"] for m in vh["missing"]} and vh["score"] > out["score"] > sc.score(f)["score"] - 100
+assert "regional" in {m["factor"] for m in sc.score(_z({"status": "error"}))["missing"]}, "failed lookup = missing, not zero"
+assert any("Very High" in e for x in vh["factors"] if x["key"] == "regional" for e in x["evidence"])
+print("regional tests passed")

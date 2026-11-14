@@ -80,7 +80,7 @@ def score_risk(building_id: int) -> str:
     (each with points_removed from the score and relative cost). Call this AFTER detect_hazard_features so detections count.
     Report this score exactly; never compute or adjust a score yourself."""
     c = _ctx(building_id)
-    f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), interior=c.get("interior"))
+    f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), zone=_zone(c), interior=c.get("interior"))
     c["facts"] = f
     r = scoring.score(f)
     r["ranked_fixes"] = scoring.rank_fixes(f)
@@ -92,11 +92,17 @@ def get_stakes(building_id: int) -> str:
     that are None are not recorded by CoStar; never estimate them."""
     return json.dumps(costar.get_stakes(building_id))
 
+def _zone(c):
+    """Official zone lookup, cached per building. Deterministic, so the score never depends on the LLM calling it."""
+    if "zone" not in c:
+        c["zone"] = hazard_zone.get_hazard_zone(c["prop"]["lat"], c["prop"]["lon"], _HAZARD)
+    return c["zone"]
+
 def get_facts(building_id) -> dict:
     """Scoring facts for a building (used by the UI for instant what-if). Builds them if score_risk has not run."""
     c = _ctx(building_id)
     if "facts" not in c:
-        c["facts"] = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), interior=c.get("interior"))
+        c["facts"] = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), zone=_zone(c), interior=c.get("interior"))
     return c["facts"]
 
 def what_if(building_id: int, fix_ids: list[str]) -> str:
@@ -114,9 +120,10 @@ def plan_budget(building_id: int, budget: float, costs: dict[str, float]) -> str
                                                  {k: float(v) for k, v in costs.items()}))
 
 def get_hazard_zone(building_id: int) -> str:
-    """Official hazard-zone lookup. May return status 'unavailable': then say so and score from imagery."""
-    p = _ctx(building_id)["prop"]
-    return json.dumps(hazard_zone.get_hazard_zone(p["lat"], p["lon"], _HAZARD))
+    """Official CAL FIRE Fire Hazard Severity Zone at the building (wildfire). Returns in_zone and class
+    (Moderate/High/Very High). 'in_zone: false' means outside the mapped zones in an older service, which is
+    not proof of low hazard. Status 'error'/'unavailable': say so."""
+    return json.dumps(_zone(_ctx(building_id)))
 
 def draft_action(building_id: int, subject: str, body: str) -> str:
     """Save a drafted action (e.g. contractor request email). Returns the file path."""
@@ -137,7 +144,10 @@ by score_risk (and callout numbers when relevant); (2) fix list taken from score
 its points_removed written as "-N points" (a reduction, never "+N") and relative cost (low/med/high), no dollar figures unless the user gave a budget;
 (3) what is at stake, from get_stakes (tenants, known employees, last sale with its price status; say
 "not recorded" for None values, never estimate); (4) interior: what get_interior saw, as uncertain image readings (say not_seen is not proof of absence; if its
-status is not ok, say why); (5) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
+status is not ok, say why); (5) resilience: 2-3 sentences on why the top fixes matter for sustainability and climate adaptation
+(protecting an existing building and its tenants avoids loss, displacement and rebuilding; wildfire risk is
+rising, so exposure fixes are adaptation). Qualitative only: no carbon, dollar or percentage figures unless a tool
+returned them, and say "not quantified"; (6) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
 Follow-up questions: use what_if for "what if I do X" and plan_budget for budget questions (ask the user for
 per-fix dollar costs if they gave none; never invent prices). Quote results exactly; deltas are reductions
 ("-N points"). Keep answers short.

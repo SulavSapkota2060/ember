@@ -20,7 +20,7 @@ WEIGHTS = {
     "protection": 15,     # sprinklers + construction material (CoStar)
     "occupancy": 5,       # tenant industry hazard (CoStar) - not wired yet
     "interior": 15,       # Matterport interior images read by a vision model (uncertain observations)
-    "regional": 10,       # official hazard zone lookup - not wired yet
+    "regional": 10,       # CAL FIRE Fire Hazard Severity Zone at the building (wildfire only)
 }
 LABELS = {
     "vegetation": "Vegetation near structure", "roof": "Roof", "surroundings": "Neighbors & attachments",
@@ -183,6 +183,20 @@ def _interior(f):
     return min(max(v, 0.0), 1.0), ev, None
 
 
+# HEURISTIC: CAL FIRE class -> 0..1. Outside every mapped zone gets 0.1, not 0: the zone maps in the public
+# service are older than CAL FIRE's newer local-area recommendations, so "outside" is not proof of low hazard.
+ZONE_RISK = {"Very High": 1.0, "High": 0.75, "Moderate": 0.5}
+
+
+def _regional(f):
+    z = f.get("zone_hazard")
+    if not z or z.get("status") != "ok":
+        return None, [], "hazard zone lookup unavailable"
+    if not z.get("in_zone"):
+        return 0.1, ["outside CAL FIRE mapped fire hazard zones (older maps; not proof of low hazard)"], None
+    return ZONE_RISK.get(z["class"], 0.5), [f"CAL FIRE Fire Hazard Severity Zone: {z['class']} ({z['area']})"], None
+
+
 def _optional(fact_key, label_key):
     def fn(f):
         v = f.get(fact_key)
@@ -196,7 +210,7 @@ def _optional(fact_key, label_key):
 _FACTORS = {
     "vegetation": _vegetation, "roof": _roof, "surroundings": _surroundings, "protection": _protection,
     "occupancy": _optional("occupancy", "occupancy"), "interior": _interior,
-    "regional": _optional("zone_hazard", "regional"),
+    "regional": _regional,
 }
 
 
