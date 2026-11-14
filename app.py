@@ -39,7 +39,7 @@ def line_for(ev):
 # ---------------- sidebar ----------------
 with st.sidebar:
     st.title("Ember")
-    st.caption("Fire readiness for commercial buildings. Scores are heuristic ESTIMATES, not a validated model.")
+    st.caption("Fire exposure for commercial buildings (lower is better). Scores are heuristic ESTIMATES, not a validated model.")
     hazard = st.selectbox("Hazard", list(HAZARDS), format_func=lambda k: HAZARDS[k]["label"])
     city = st.selectbox("City", ["Los Angeles", "Houston"])
     multi = st.checkbox("Include apartments", False)
@@ -107,7 +107,8 @@ with rail:
         ranked = scoring.rank_fixes(facts)
         chosen = [r["id"] for r in ranked if S.get(f"fix_{bid}_{r['id']}")]
         after = scoring.score(scoring.apply_fixes(facts, chosen))
-        st.metric("Fire-readiness score (ESTIMATE)", f"{after['score']} / 100",
+        st.metric("Fire exposure score (ESTIMATE, lower is better)", f"{after['score']} / 100",
+                  help="0-100 where HIGHER means MORE exposed. Fixes lower the score. Heuristic estimate, not a validated model.",
                   delta=f"{after['score'] - base['score']} pts vs. now" if chosen else None, delta_color="inverse")
         z = facts.get("zone_hazard") or {}
         if z.get("status") == "ok":

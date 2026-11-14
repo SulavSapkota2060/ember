@@ -87,7 +87,7 @@ def get_view(building_id) -> dict:
     return {"images": c.get("detect_result"), "interior": _interior_view(c)}
 
 def score_risk(building_id: int) -> str:
-    """Compute the fire-readiness score with the project's rule-based heuristic (code, not your judgement).
+    """Compute the fire EXPOSURE score (higher = more exposed, lower is better) with the project's rule-based heuristic (code, not your judgement).
     Returns score 0-100, band, per-factor points with evidence, factors missing data, and ranked fixes
     (each with points_removed from the score and relative cost). Call this AFTER detect_hazard_features so detections count.
     Report this score exactly; never compute or adjust a score yourself."""
@@ -153,7 +153,8 @@ data tools (these can run together), then call detect_hazard_features and get_in
 THEN score_risk, then report.
 The score comes only from score_risk: report its number, band and factors exactly. Never compute, adjust or
 estimate a score yourself.
-Report format: (1) score 0-100 labelled ESTIMATE with 3-5 reasons that cite the evidence strings returned
+Report format: (1) exposure score 0-100 labelled ESTIMATE (higher = more exposed, lower is better; never call it a
+"readiness" score) with 3-5 reasons that cite the evidence strings returned
 by score_risk (and callout numbers when relevant); (2) fix list taken from score_risk's ranked_fixes, with
 its points_removed written as "-N points" (a reduction, never "+N") and relative cost (low/med/high), no dollar figures unless the user gave a budget;
 (3) what is at stake, from get_stakes (tenants, known employees, last sale with its price status; say
@@ -215,7 +216,8 @@ Process: (1) write a plan with the todo tool; (2) delegate with the task tool: i
 parallel to exterior-analyst, interior-inspector and stakes-analyst, each told the building_id; (3) call score_risk
 (it reads what the specialists gathered); (4) write the report; update todo statuses as you go.
 The score comes only from score_risk: report its number, band and factors exactly. Never compute or adjust a score.
-Report format: (1) score 0-100 labelled ESTIMATE with 3-5 reasons citing score_risk's evidence strings; (2) fix list
+Report format: (1) exposure score 0-100 labelled ESTIMATE (higher = more exposed, lower is better; never call it a "readiness"
+score) with 3-5 reasons citing score_risk's evidence strings; (2) fix list
 from score_risk's ranked_fixes, points_removed written as "-N points" (a reduction, never "+N") and relative cost,
 no dollar figures unless the user gave a budget; (3) what is at stake, from the stakes-analyst (not recorded = say so;
 carbon at stake is upfront A1-A3 carbon a rebuild would re-emit, US commercial average, no probability of loss, never

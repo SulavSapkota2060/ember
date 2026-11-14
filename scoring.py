@@ -1,4 +1,4 @@
-"""Transparent fire-readiness heuristic. An ESTIMATE, not a validated model.
+"""Transparent fire EXPOSURE heuristic (higher = more exposed, lower is better). An ESTIMATE, not a validated model.
 
 Pure Python, no LLM, no network. The agent calls this; the UI toggles call it directly.
 Score 0-100, higher = more exposed. Each factor is 0..1 and weighted. Factors with no data
