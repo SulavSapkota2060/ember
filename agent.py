@@ -1,16 +1,29 @@
 import json, threading
 from config import LLM_MODEL
 from hazards import HAZARDS
-import scoring, sustainability
+import scoring, sustainability, review, llm
+from config import VISION_MODEL as VISION, VISION_FIRST_MODEL as VISION_FIRST
 from tools import costar, vexcel, hazard_zone, actions, matterport, interior
 
+import time
+from concurrent.futures import ThreadPoolExecutor
 _cache = {}
-_lock = threading.Lock()
+_locks, _locks_guard = {}, threading.Lock()
+_pool = ThreadPoolExecutor(8)      # data workers (exterior, interior, stakes, zone) run here
+_pre_pool = ThreadPoolExecutor(2)  # whole-building prefetch jobs (separate pool so nested submits cannot deadlock)
+_prefetched = {}                   # building_id -> Future
+
+
+def _key_lock(building_id, key):
+    """One lock per (building, step): parallel workers for the same building never wait on each other or on other buildings."""
+    with _locks_guard:
+        return _locks.setdefault((int(building_id), key), threading.Lock())
+
 _HAZARD = "wildfire"  # set by build_agent; tools read it so the LLM never passes it  # building_id -> {"prop":..., "elements":...}
 
 def _ctx(building_id):
     building_id = int(building_id)
-    with _lock:  # tools run in parallel threads; fetch each building once
+    with _key_lock(building_id, "ctx"):  # tools run in parallel threads; fetch each building once
         if building_id not in _cache:
             p = costar.get_property(building_id)
             _cache[building_id] = {"prop": p, "el": vexcel.get_property_elements(p["lat"], p["lon"])}
@@ -36,6 +49,12 @@ def detect_hazard_features(building_id: int) -> str:
     an annotated image with numbered callouts plus a close-up crop per detection. Returns detections
     (n, label, confidence) and image paths. Use the callout numbers in your report."""
     c = _ctx(building_id)
+    with _key_lock(building_id, "detect"):
+        if c.get("detect_result"):
+            return json.dumps(c["detect_result"])
+        return _detect(c)
+
+def _detect(c):
     p, wkt = c["prop"], c["el"]["parcel_wkt"]
     dets = vexcel.detect(p["lat"], p["lon"], HAZARDS[_HAZARD]["detect_labels"], wkt)
     ann = vexcel.annotate(p["lat"], p["lon"], dets, wkt)
@@ -59,7 +78,7 @@ def get_interior(building_id: int) -> str:
     if not matterport.available():
         c["interior_raw"] = {"status": "unavailable", "reason": "Matterport credentials not set"}
         return json.dumps(c["interior_raw"])
-    with _lock:
+    with _key_lock(building_id, "interior"):
         if "interior_raw" not in c:
             try:
                 imgs = matterport.fetch_images(models)
@@ -108,8 +127,9 @@ def get_stakes(building_id: int) -> str:
 
 def _zone(c):
     """Official zone lookup, cached per building. Deterministic, so the score never depends on the LLM calling it."""
-    if "zone" not in c:
-        c["zone"] = hazard_zone.get_hazard_zone(c["prop"]["lat"], c["prop"]["lon"], _HAZARD)
+    with _key_lock(c["prop"]["id"], "zone"):
+        if "zone" not in c:
+            c["zone"] = hazard_zone.get_hazard_zone(c["prop"]["lat"], c["prop"]["lon"], _HAZARD)
     return c["zone"]
 
 def get_facts(building_id) -> dict:
@@ -132,6 +152,141 @@ def plan_budget(building_id: int, budget: float, costs: dict[str, float]) -> str
     invent prices. Fixes without a user cost are returned in skipped_no_cost."""
     return json.dumps(scoring.plan_within_budget(get_facts(building_id), float(budget),
                                                  {k: float(v) for k, v in costs.items()}))
+
+# ---- fast path: all data work in parallel (and ahead of time), one short report from the LLM ----
+def _safe(fn, *a):
+    try:
+        return fn(*a)
+    except Exception as e:  # a failed worker is reported, never hidden or invented
+        return json.dumps({"status": "error", "reason": f"{type(e).__name__}: {str(e)[:160]}"})
+
+def _gather(building_id):
+    """Run the four data workers in parallel. Each is idempotent, so calling this twice costs nothing."""
+    bid = int(building_id)
+    t0 = time.time()
+    futs = [_pool.submit(_safe, detect_hazard_features, bid), _pool.submit(_safe, get_interior, bid),
+            _pool.submit(_safe, get_stakes, bid), _pool.submit(_safe, lambda b: json.dumps(_zone(_ctx(b))), bid)]
+    for f in futs:
+        f.result()
+    _ctx(bid)["gather_seconds"] = round(time.time() - t0, 1)
+
+def prefetch_async(building_id, hazard="wildfire"):
+    """Start gathering a building's data in the background (e.g. as soon as it is selected). Idempotent."""
+    global _HAZARD
+    _HAZARD = hazard
+    bid = int(building_id)
+    with _locks_guard:
+        if bid not in _prefetched:
+            _prefetched[bid] = _pre_pool.submit(_gather, bid)
+    return _prefetched[bid]
+
+def _worker_reports(bid, f, sc, stk, cs, inner):
+    """What each specialist worker found, in one line each, built from the real tool results."""
+    z = f.get("zone_hazard") or {}
+    zone = (f"CAL FIRE zone {z['class']}" if z.get("in_zone") else "outside CAL FIRE mapped zones") if z.get("status") == "ok" else "CAL FIRE zone unavailable"
+    c = _ctx(bid)
+    dets = (c.get("detect_result") or {}).get("detections") or []
+    labels = {}
+    for d in dets:
+        labels[d["label"]] = labels.get(d["label"], 0) + 1
+    ext = (f"Tree cover zones 1/2/3: {f.get('z1t')}/{f.get('z2t')}/{f.get('z3t')}%. Roof {f.get('roof_material')}, "
+           f"{f.get('roof_vents', 0)} vents unscreened. {zone}. Detections: {', '.join(f'{n} {k}' for k, n in labels.items()) or 'none'}.")
+    if inner.get("status") == "ok":
+        obs = inner["observations"]
+        seen = [k.replace("_", " ") for k, o in obs.items() if o["status"] == "seen"]
+        down = [k.replace("_", " ") for k, o in obs.items() if o["first_pass"] == "seen" and o["status"] != "seen"]
+        ints = (f"{inner['n_images']} Matterport images read ({_short(VISION_FIRST)} first pass, {_short(VISION)} second look). "
+                f"Seen: {', '.join(seen) or 'none'}. Downgraded after second look: {', '.join(down) or 'none'}.")
+    else:
+        ints = f"Interior unavailable: {inner.get('status')} {inner.get('reason', '')}".strip()
+    sale = stk.get("last_sale")
+    stakes = (f"{stk['tenant_count']} tenants, {nr(stk['employees_known'])} employees known ({stk['employees_known_for']}), "
+              f"{nr(stk['occupied_sqft'])} sq ft occupied; last sale "
+              f"{('$' + format(sale['price'], ',.0f') + ' ' + sale['date'] + ' (' + sale['price_status'] + (', PORTFOLIO sale' if sale.get('portfolio_sale') else '') + ')') if sale and sale.get('price') else 'not recorded'}; "
+              f"carbon at stake {cs['tonnes_co2e']:,} t CO2e." if cs else "carbon at stake not computed (area not recorded).")
+    return {"exterior-analyst": ext, "interior-inspector": ints, "stakes-analyst": stakes}
+
+def nr(v):
+    return "not recorded" if v is None else (f"{v:,.0f}" if isinstance(v, (int, float)) else str(v))
+
+def _short(m):
+    return str(m).split(":")[-1].replace("claude-", "")
+
+def _brief(building_id) -> dict:
+    """Compact, complete evidence for the report writer. Also leaves the full facts in the cache for the UI."""
+    bid = int(building_id)
+    c = _ctx(bid)
+    c["facts"] = f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), zone=_zone(c), interior=c.get("interior"))
+    sc = scoring.score(f)
+    fixes = scoring.carbon_smart(scoring.rank_fixes(f))
+    stk = costar.get_stakes(bid)
+    cs = sustainability.carbon_at_stake(c["prop"].get("gba_sqft"))
+    inner = _interior_view(c)
+    c["worker_reports"] = _worker_reports(bid, f, sc, stk, cs, inner)
+    z = f.get("zone_hazard") or {}
+    return {
+        "building": {"name": c["prop"].get("name"), "address": c["prop"].get("address"), "type": c["prop"].get("type"),
+                     "stories": c["prop"].get("stories"), "sprinklers_costar": c["prop"].get("sprinklers")},
+        "exposure_score": sc["score"], "band": sc["band"],
+        "top_factors": [{"factor": x["label"], "points": x["points"], "evidence": x["evidence"]} for x in sc["factors"][:5]],
+        "missing_factors": [m["factor"] for m in sc["missing"]],
+        "fixes": [{"fix": x["label"], "points_removed": x["points_removed"], "cost": x["cost"], "carbon": x["carbon"],
+                   "low_payoff_for_carbon": x["low_payoff"], "tradeoff": x["tradeoff"]} for x in fixes[:5]],
+        "hazard_zone": ({"class": z.get("class"), "map": z.get("area")} if z.get("in_zone") else
+                        ("outside mapped zones (older maps, not proof of low hazard)" if z.get("status") == "ok" else "unavailable")),
+        "stakes": {"tenants": stk["tenant_count"], "largest_tenants": [t["name"] for t in stk["tenants"][:3]],
+                   "employees_known": stk["employees_known"], "employees_coverage": stk["employees_known_for"],
+                   "occupied_sqft": stk["occupied_sqft"], "last_sale": stk["last_sale"]},
+        "carbon_at_stake_tonnes_co2e": cs["tonnes_co2e"] if cs else None,
+        "carbon_note": "upfront A1-A3 a rebuild would re-emit; US commercial average; not a forecast; never 'avoided'",
+        "interior": ({k: o["status"] for k, o in inner["observations"].items()} if inner.get("status") == "ok" else inner.get("status")),
+        "interior_caveat": "image readings are uncertain; not_seen is not proof of absence; sprinkler reading not scored",
+    }
+
+def assess(building_id: int) -> str:
+    """Run the whole assessment in one step: parallel specialist workers (exterior: Vexcel + CAL FIRE zone; interior:
+    Matterport images read by a vision model with a second look; stakes: CoStar + carbon) and the scorer. Returns
+    one compact evidence brief with the exposure score, top factors, ranked fixes, stakes and gaps. Quote it exactly."""
+    bid = int(building_id)
+    fut = _prefetched.get(bid)
+    if fut is not None:
+        fut.result()
+    _gather(bid)  # no-op when prefetched
+    return json.dumps(_brief(bid))
+
+def code_review(building_id, text: str) -> dict:
+    """Instant, no-LLM review of a report: every number must appear in the evidence. Same JSON shape as the reviewer agent."""
+    r = review.check_numbers(text, _evidence(building_id))
+    issues = [{"claim": u["context"], "problem": f"number {u['number']} not found in the evidence"} for u in r["unmatched"]]
+    return {"verdict": "pass" if not issues else "revise", "numbers_checked": r["checked"], "issues": issues, "by": "code"}
+
+def _evidence(building_id) -> dict:
+    """Ground truth for the reviewer: the actual outputs of the data tools and the scorer for this building."""
+    c = _ctx(building_id)
+    f = get_facts(building_id)
+    sc = scoring.score(f)
+    stk = costar.get_stakes(building_id)
+    stk["embodied_carbon_at_stake"] = sustainability.carbon_at_stake(c["prop"].get("gba_sqft"))
+    det = (c.get("detect_result") or {}).get("detections") or []
+
+    def slim(o):  # same parcel data the exterior analyst saw, minus long geometry strings
+        if isinstance(o, dict):
+            return {k: slim(v) for k, v in o.items() if "wkt" not in k and "geometry" not in k}
+        return [slim(v) for v in o] if isinstance(o, list) else o
+    return {"building_id": int(building_id), "property": c["prop"], "parcel_attributes": slim(c["el"]["attrs"]), "score": sc,
+            "ranked_fixes": scoring.rank_fixes(f), "stakes": stk, "hazard_zone": _zone(c),
+            "interior": _interior_view(c), "detections": det,
+            "scoring_conventions": "score 0-100, HIGHER = MORE EXPOSED; points_removed are reductions written as -N"}
+
+def get_evidence(building_id: int) -> str:
+    """The ground-truth evidence bundle for a building: score and factor evidence strings, ranked fixes, stakes,
+    carbon at stake, hazard zone, interior observations, detections. Use it to audit a draft report."""
+    return json.dumps(_evidence(building_id))
+
+def check_numbers(building_id: int, text: str) -> str:
+    """Code check (no LLM): list every number in `text` that does NOT appear in the evidence bundle. Unmatched
+    numbers may still be valid sums/differences of evidence numbers; judge those yourself."""
+    return json.dumps(review.check_numbers(text, _evidence(building_id)))
 
 def get_hazard_zone(building_id: int) -> str:
     """Official CAL FIRE Fire Hazard Severity Zone at the building (wildfire). Returns in_zone and class
@@ -209,14 +364,32 @@ def _subagents():
                           "tenant count, largest tenants, known employees (and how many tenants that covers), occupied sq ft, "
                           "last sale with its price status, and embodied_carbon_at_stake with its caveats (US commercial "
                           "average, A1-A3 only, not a forecast). " + _SUB_RULES,
-         "tools": [get_stakes], "model": LIGHT_MODEL},
+         "tools": [get_stakes], "model": llm.chat(LIGHT_MODEL)},
+        {"name": "reviewer",
+         "description": "Independent auditor of a DRAFT report. Send it the building_id and the full draft text; it checks "
+                        "every claim against the ground-truth evidence and returns a JSON verdict with issues. It never "
+                        "rewrites the report.",
+         "system_prompt": "You are the independent reviewer. You get a building_id and a DRAFT report. You did not write it. "
+                          "Call get_evidence, call check_numbers with the draft text, then audit: (a) every number and claim "
+                          "is supported by the evidence (a correct sum or difference of evidence numbers is fine; say so); "
+                          "(b) points removed are written as -N, never +N; (c) the score is called an exposure ESTIMATE, "
+                          "higher = more exposed; (d) no distances or units for defensible-space zones; (e) carbon at stake "
+                          "is never called avoided or saved; (f) not_seen is never stated as absent; (g) hazard-zone claims "
+                          "match the evidence; (h) no dollar figures the user did not give. Reply with JSON only: "
+                          '{"verdict": "pass|revise", "numbers_checked": N, "issues": [{"claim": "...", "problem": "...", '
+                          '"evidence": "..."}]}. Do not rewrite the report. Only flag real problems you can point to in the evidence.',
+         "tools": [get_evidence, check_numbers]},
     ]
 
 SYSTEM_TEAM = """You are Ember, the orchestrator of a hazard-readiness team for commercial buildings.
 {hazard_prompt}
 Process: (1) write a plan with the todo tool; (2) delegate with the task tool: in ONE turn issue three task calls in
 parallel to exterior-analyst, interior-inspector and stakes-analyst, each told the building_id; (3) call score_risk
-(it reads what the specialists gathered); (4) write the report; update todo statuses as you go.
+(it reads what the specialists gathered); (4) write a DRAFT report and send it, in full, to the reviewer with one task
+call (description: "building_id=N" then the draft text); do NOT output the draft as your answer; (5) if the reviewer's
+verdict is "revise", correct every issue it raised (re-delegate or re-run score_risk only if an issue needs it), then
+give the final report; if "pass", give the draft unchanged. End the final report with one line:
+"Reviewer: <verdict>, <numbers_checked> numbers checked, <k> issues fixed." Update todo statuses as you go.
 The score comes only from score_risk: report its number, band and factors exactly. Never compute or adjust a score.
 Report format: (1) exposure score 0-100 labelled ESTIMATE (higher = more exposed, lower is better; never call it a "readiness"
 score) with 3-5 reasons citing score_risk's evidence strings; (2) fix list
@@ -235,8 +408,29 @@ return. Do not state distances for defensible-space zones; do not interpret the 
 by the app; you cannot open image files."""
 
 TEAM_TOOLS = [score_risk, what_if, plan_budget, draft_action]
+FAST_TOOLS = [assess, what_if, plan_budget, draft_action]
 
-def build_agent(hazard: str, memory: bool = False, team: bool = True):
+SYSTEM_FAST = """You are Ember, a wildfire exposure analyst for commercial buildings.
+{hazard_prompt}
+Process: in ONE turn call write_todos (two items: "Gather evidence", "Write report") AND assess(building_id) together,
+writing no text before the tools. Then write the report as your only text message. Never call write_todos again.
+Everything comes from assess: quote its numbers and evidence strings exactly; never compute, round or adjust anything.
+REPORT: 110 words maximum, markdown, exactly this shape:
+**Exposure N/100 (band) · ESTIMATE; higher = more exposed, lower is better**
+One short verdict sentence.
+**Why:** 3 bullets quoting evidence strings.
+**Fix first:** 3 bullets: fix · -N points · cost · carbon tag (our heuristic); say "low payoff for its carbon" when flagged and
+name a tradeoff if present.
+**At stake:** one line: tenants, known employees (with coverage), carbon at stake in tonnes CO2e (upfront A1-A3 a rebuild
+would re-emit, US commercial average, not a forecast, never "avoided"); say "not recorded" for missing values.
+**Gaps:** one line: missing factors and uncertain interior readings (not_seen is not proof of absence).
+Rules: the score is a heuristic estimate; never call it a "readiness" score; no zone distances; do not interpret roof
+condition; never invent data. Follow-ups: what_if for "what if I do X", plan_budget for budgets (ask for per-fix dollar
+costs, never invent prices), draft_action to save a draft. Follow-up answers: 80 words maximum."""
+
+def build_agent(hazard: str, memory: bool = False, mode: str = "fast"):
+    """mode: 'fast' (default: parallel workers + one short report), 'deep' (LLM subagents + LLM reviewer, slower),
+    'solo' (one agent, all tools)."""
     if not LLM_MODEL:
         raise RuntimeError("LLM_MODEL not set in .env (format 'provider:model'). Provider undecided.")
     global _HAZARD
@@ -249,26 +443,41 @@ def build_agent(hazard: str, memory: bool = False, team: bool = True):
         from langgraph.checkpoint.memory import InMemorySaver
         kw["checkpointer"] = InMemorySaver()
         kw["interrupt_on"] = {"draft_action": True}  # human approves/edits/rejects drafts before they are saved
-    if team:
-        return create_deep_agent(model=LLM_MODEL, tools=TEAM_TOOLS, subagents=_subagents(),
-                                 middleware=[TodoListMiddleware()],
-                                 system_prompt=SYSTEM_TEAM.format(hazard_prompt=HAZARDS[hazard]["prompt"]), **kw)
-    return create_deep_agent(model=LLM_MODEL, tools=TOOLS, middleware=[TodoListMiddleware()],
-                             system_prompt=SYSTEM_SOLO.format(hazard_prompt=HAZARDS[hazard]["prompt"]), **kw)
+    model = llm.chat(LLM_MODEL)
+    hp = HAZARDS[hazard]["prompt"]
+    if mode == "deep":
+        return create_deep_agent(model=model, tools=TEAM_TOOLS, subagents=_subagents(), middleware=[TodoListMiddleware()],
+                                 system_prompt=SYSTEM_TEAM.format(hazard_prompt=hp), **kw)
+    if mode == "solo":
+        return create_deep_agent(model=model, tools=TOOLS, middleware=[TodoListMiddleware()],
+                                 system_prompt=SYSTEM_SOLO.format(hazard_prompt=hp), **kw)
+    return create_deep_agent(model=model, tools=FAST_TOOLS, middleware=[TodoListMiddleware()],
+                             system_prompt=SYSTEM_FAST.format(hazard_prompt=hp), **kw)
 
-_LANE_BY_TOOL = {"get_stakes": "stakes-analyst", "get_interior": "interior-inspector", "get_property": "exterior-analyst",
+_LANE_BY_TOOL = {"get_evidence": "reviewer", "check_numbers": "reviewer", "get_stakes": "stakes-analyst",
+                 "get_interior": "interior-inspector", "get_property": "exterior-analyst",
                  "get_parcel_attributes": "exterior-analyst", "get_aerial": "exterior-analyst",
                  "get_hazard_zone": "exterior-analyst", "detect_hazard_features": "exterior-analyst"}
 
 
 def _events(agent, inp, cfg):
-    """Yield UI events: plan | tool_call | tool_result | text | usage | interrupt, tagged with `lane`."""
-    lane_of = {}  # subgraph namespace -> subagent name, learned from the first tool it calls
-    for ns, chunk in agent.stream(inp, config=cfg, stream_mode="updates", subgraphs=True):
+    """Yield UI events: plan | tool_call | tool_result | handoff | text_delta | text | usage | interrupt, tagged with `lane`."""
+    lane_of = {}      # subgraph namespace -> subagent name, learned from the first tool it calls
+    sub_of_call = {}  # orchestrator task tool_call id -> subagent name (to label the report that comes back)
+    assess_bid = {}   # assess tool_call id -> building_id (its worker reports are read from the cache)
+    for ns, mode, data in agent.stream(inp, config=cfg, stream_mode=["updates", "messages"], subgraphs=True):
         lane = "orchestrator"
         if ns:
             lane = lane_of.get(tuple(ns), "subagent")
-        for _node, upd in (chunk or {}).items():
+        if mode == "messages":  # token stream of the orchestrator's own answer, for instant on-screen text
+            ch = data[0]
+            if not ns and type(ch).__name__ == "AIMessageChunk" and not getattr(ch, "tool_call_chunks", None):
+                t = ch.content if isinstance(ch.content, str) else "".join(
+                    b.get("text", "") for b in ch.content if isinstance(b, dict) and b.get("type") == "text")
+                if t:
+                    yield {"type": "text_delta", "text": t, "lane": lane}
+            continue
+        for _node, upd in (data or {}).items():
             if _node == "__interrupt__":
                 for it in upd:
                     v = getattr(it, "value", it) or {}
@@ -283,6 +492,16 @@ def _events(agent, inp, cfg):
                 if kind == "ai":
                     u = getattr(m, "usage_metadata", None)
                     for tc in getattr(m, "tool_calls", []) or []:
+                        if tc["name"] == "task" and not ns:
+                            who = (tc["args"] or {}).get("subagent_type", "subagent")
+                            sub_of_call[tc["id"]] = who
+                            yield {"type": "handoff", "from": "orchestrator", "to": who,
+                                   "text": str((tc["args"] or {}).get("description", ""))}
+                        if tc["name"] == "assess" and not ns:
+                            assess_bid[tc["id"]] = int((tc["args"] or {}).get("building_id", 0))
+                            for who in ("exterior-analyst", "interior-inspector", "stakes-analyst"):
+                                yield {"type": "handoff", "from": "orchestrator", "to": who,
+                                       "text": f"assess building_id={assess_bid[tc['id']]}: gather your data and report back"}
                         if ns and tuple(ns) not in lane_of and tc["name"] in _LANE_BY_TOOL:
                             lane_of[tuple(ns)] = lane = _LANE_BY_TOOL[tc["name"]]
                         yield {"type": "tool_call", "name": tc["name"], "args": tc["args"], "lane": lane}
@@ -293,12 +512,18 @@ def _events(agent, inp, cfg):
                     if txt.strip() and not getattr(m, "tool_calls", None) and not ns:
                         yield {"type": "text", "text": txt, "lane": lane}
                 elif kind == "tool":
+                    cid = getattr(m, "tool_call_id", "")
+                    if m.name == "task" and not ns:
+                        yield {"type": "handoff", "from": sub_of_call.get(cid, "subagent"), "to": "orchestrator", "text": str(m.content)}
+                    if m.name == "assess" and cid in assess_bid:
+                        for who, rep in (_cache.get(assess_bid[cid], {}).get("worker_reports") or {}).items():
+                            yield {"type": "handoff", "from": who, "to": "orchestrator", "text": rep}
                     yield {"type": "tool_result", "name": m.name, "lane": lane,
                            "content": str(m.content)[:20000 if m.name in ("detect_hazard_features", "get_interior") else 2000]}
 
 
 def stream_events(agent, building_id: int, hazard: str, user_msg: str | None = None, thread_id: str | None = None):
-    msg = user_msg or f"Assess {hazard} readiness for building_id={building_id}."
+    msg = user_msg or f"Assess {hazard} exposure for building_id={building_id}."
     cfg = {"configurable": {"thread_id": thread_id}} if thread_id else None
     yield from _events(agent, {"messages": [{"role": "user", "content": msg}]}, cfg)
 

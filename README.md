@@ -25,9 +25,18 @@ tenant displacement and rebuilding, and a rebuild re-emits the upfront embodied 
   uses costs *you* enter, one-click agent jobs, and a follow-up chat. The agent can tick the fixes on screen.
 
 ## Agent design (LangChain deepagents)
-Orchestrator + three specialist subagents (`exterior-analyst`, `interior-inspector`, `stakes-analyst`) run in parallel; the
-orchestrator then calls `score_risk` and writes the report. **The score is computed by code, never by the LLM.** Drafts (e.g. a
-contractor email) pass a **human approval gate** (approve / edit / reject) before anything is saved.
+**Fast mode (default, about 7-11 s):** a deep agent plans (todo tool), then calls one `assess` tool that runs the specialist
+workers **in parallel** (exterior: Vexcel + CAL FIRE; interior: Matterport images read by a cheap model, then every "seen"
+claim must be confirmed by a stronger model; stakes: CoStar + carbon) and scores the building **in code**. The model then writes one short,
+streamed report. A **code reviewer** checks that every number in the report appears in the evidence. Data for the selected
+building is preloaded while you read the stakes. The workers are code (plus the vision models), not separate LLM agents.
+
+**Deep mode (about 35-50 s):** an orchestrator delegates to three **LLM subagents** (`exterior-analyst`, `interior-inspector`,
+`stakes-analyst`) and sends its draft to an independent **LLM reviewer** that audits it against the evidence; the orchestrator
+revises. The Agent team tab shows the real messages agents sent each other.
+
+In both modes **the score is computed by code, never by the LLM.** Drafts (e.g. a contractor email) pass a **human approval gate**
+(approve / edit / reject) before anything is saved.
 
 ## Data and limits (read this)
 - CAL FIRE zone lookup uses the public statewide service, whose local-area map is from 2011 (older than CAL FIRE's newer

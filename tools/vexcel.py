@@ -109,12 +109,14 @@ def annotate(lat, lon, detections, parcel_wkt=None):
                 "crop": "bounding_box", "image-format": "jpeg",
                 "drawing": [{"wkt": wkt, "outline-width": 3, "outline-color": "rgb(255,204,0)"}] + boxes}, as_json=False)
     ann.write_bytes(img)
-    crops = []
-    for d in detections:  # close-up = ortho of the detection's own bbox
+    def crop(d):  # close-up = ortho of the detection's own bbox (independent calls, so run them in parallel)
         cp = OUT_DIR / f"crop_{k}_{d['n']}.jpg"
         cp.write_bytes(_post("ortho/extract", {"wkt": d["bbox_wkt"], "srid": 4326, "layer": LAYERS, "buffer-meter": 5,
                        "crop": "bounding_box", "image-format": "jpeg", "destination-dimensions": "300,300"}, as_json=False))
-        crops.append({"n": d["n"], "label": d["label"], "path": str(cp)})
+        return {"n": d["n"], "label": d["label"], "path": str(cp)}
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(6) as ex:
+        crops = list(ex.map(crop, detections))
     return {"annotated": str(ann), "crops": crops}
 
 def _mock_ortho(path):

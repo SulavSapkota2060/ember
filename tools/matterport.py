@@ -34,31 +34,41 @@ def _img(url: str) -> Image.Image:
     return Image.open(io.BytesIO(r.content)).convert("RGB")
 
 
-def fetch_images(model_ids: list[str], max_models: int = 4, sheets: int = 2) -> list[dict]:
-    """Per model: its thumbnail. For the first `sheets` models also a contact sheet of one mid-tour
-    panorama (all 6 cube faces tiled 3x2, so ceilings are visible too). Saved under out/."""
+def _one_model(i: int, mid: str, sheets: int) -> list[dict]:
     out = []
-    for i, mid in enumerate(model_ids[:max_models]):
-        d = _gql('{ model(id:"%s") { name image { url } panoLocations { skybox(resolution:"low") { children } } } }' % mid)
-        m = d.get("model") or {}
-        name = m.get("name") or mid
-        thumb = (m.get("image") or {}).get("url")
-        if thumb:
-            im = _img(thumb)
+    d = _gql('{ model(id:"%s") { name image { url } panoLocations { skybox(resolution:"low") { children } } } }' % mid)
+    m = d.get("model") or {}
+    name = m.get("name") or mid
+    thumb = (m.get("image") or {}).get("url")
+    panos = [x for x in (m.get("panoLocations") or []) if (x.get("skybox") or {}).get("children")]
+    from concurrent.futures import ThreadPoolExecutor
+    faces_urls = panos[len(panos) // 2]["skybox"]["children"][:6] if (i < sheets and panos) else []
+    with ThreadPoolExecutor(7) as ex:  # thumbnail + cube faces are independent downloads
+        f_thumb = ex.submit(_img, thumb) if thumb else None
+        f_faces = [ex.submit(_img, u) for u in faces_urls]
+        if f_thumb:
+            im = f_thumb.result()
             im.thumbnail((1024, 1024))
             p = OUT_DIR / f"mp_{mid}_thumb.jpg"
             im.save(p, quality=85)
             out.append({"path": str(p), "caption": f"{name} (model thumbnail)", "model_id": mid,
                         "model_name": name, "kind": "thumbnail", "view_url": view_url(mid)})
-        panos = [x for x in (m.get("panoLocations") or []) if (x.get("skybox") or {}).get("children")]
-        if i < sheets and panos:
-            faces = panos[len(panos) // 2]["skybox"]["children"][:6]
+        if f_faces:
             sheet = Image.new("RGB", (1200, 800))
-            for k, u in enumerate(faces):
-                f = _img(u).resize((400, 400))
-                sheet.paste(f, ((k % 3) * 400, (k // 3) * 400))
+            for k, f in enumerate(f_faces):
+                sheet.paste(f.result().resize((400, 400)), ((k % 3) * 400, (k // 3) * 400))
             p = OUT_DIR / f"mp_{mid}_sheet.jpg"
             sheet.save(p, quality=85)
             out.append({"path": str(p), "caption": f"{name} (one panorama, all 6 cube faces tiled, incl. ceiling)",
                         "model_id": mid, "model_name": name, "kind": "panorama", "view_url": view_url(mid)})
     return out
+
+
+def fetch_images(model_ids: list[str], max_models: int = 4, sheets: int = 2) -> list[dict]:
+    """Per model: its thumbnail. For the first `sheets` models also a contact sheet of one mid-tour panorama (all 6
+    cube faces tiled 3x2, so ceilings are visible too). Saved under out/. Models and downloads run in parallel."""
+    from concurrent.futures import ThreadPoolExecutor
+    ids = model_ids[:max_models]
+    with ThreadPoolExecutor(max(1, len(ids))) as ex:
+        parts = list(ex.map(lambda t: _one_model(t[0], t[1], sheets), enumerate(ids)))
+    return [x for p in parts for x in p]

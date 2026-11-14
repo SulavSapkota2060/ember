@@ -1,4 +1,4 @@
-import json, uuid
+import json, os, threading, time, uuid
 import altair as alt
 import streamlit as st
 from config import MOCK, LLM_MODEL, OUT_DIR
@@ -12,7 +12,7 @@ import agent as ag
 st.set_page_config(page_title="Ember", layout="wide")
 S = st.session_state
 LANE_ICON = {"orchestrator": "🧭", "exterior-analyst": "🛰️", "interior-inspector": "🏢", "stakes-analyst": "💼",
-             "subagent": "🤖"}
+             "reviewer": "🔎", "subagent": "🤖"}
 QUICK = {  # one-click agent jobs (no typing); each is sent to the same agent thread as a follow-up
     "Plan my retrofit budget": "I have $5,000. Use these costs: screen vents $800, clear zone 1 $2,500, thin zone 2 $1,500, "
                                "clear roof debris $400, clear dry brush $600. What should I do first? Use plan_budget.",
@@ -23,6 +23,10 @@ QUICK = {  # one-click agent jobs (no typing); each is sent to the same agent th
     "Draft contractor email": "Draft a contractor request email for the cheapest fix with a real score effect, using the "
                               "draft_action tool.",
 }
+STRESS_LLM = ("This is a TEST with planted errors. First call score_risk. Then write a SHORT draft report (5 lines) containing "
+              "these deliberate errors: exposure score 41, vegetation zone 1 tree cover 63%, and call the carbon at stake "
+              "'avoided'. Send that draft to the reviewer with one task call, then give the corrected short report and the "
+              "Reviewer line.")
 
 
 def nr(v):
@@ -59,6 +63,10 @@ with st.sidebar:
     st.write("Vexcel: **MOCK**" if MOCK else "Vexcel: live")
     if not LLM_MODEL:
         st.warning("LLM_MODEL not set in .env")
+    deep = st.checkbox("Deep mode (LLM subagents + LLM reviewer, slower)", False,
+                       help="Default 'fast' mode runs the specialist workers in parallel and writes one short report; a code "
+                            "reviewer checks every number. Deep mode uses separate LLM subagents and an LLM reviewer (about "
+                            "50s).")
     go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL) or view_mode == "Portfolio", width="stretch")
 
 if view_mode == "Portfolio":
@@ -109,6 +117,23 @@ if view_mode == "Portfolio":
 if not sel:
     st.stop()
 
+
+@st.cache_resource
+def _warm_start():
+    """Once per server start: load the big CoStar files and prepare the demo buildings in the background."""
+    def job():
+        for f in (costar._props, costar._models, costar._occupancies, costar._companies, costar._sales):
+            f()
+        for i in os.environ.get("DEMO_BUILDING_IDS", "248351,249226").split(","):
+            if i.strip():
+                ag.prefetch_async(int(i), "wildfire")
+    threading.Thread(target=job, daemon=True).start()
+    return True
+
+
+_warm_start()
+ag.prefetch_async(sel["id"], hazard)  # starts gathering this building's data while the user reads the stakes (idempotent)
+
 run = S.get("run")
 if run and run["bid"] != sel["id"]:
     run = None  # a different building is selected: show it fresh
@@ -116,10 +141,12 @@ if run and run["bid"] != sel["id"]:
 
 def start_run():
     r = {"bid": sel["id"], "hazard": hazard, "tid": uuid.uuid4().hex, "lanes": {}, "plan": [], "report": "",
-         "chat": [], "tokens": [0, 0], "pending": None, "apply": []}
-    r["agent"] = ag.build_agent(hazard, memory=True)
+         "chat": [], "tokens": [0, 0], "pending": None, "apply": [], "handoffs": [], "deep": deep, "seconds": None}
+    t0 = time.time()
+    r["agent"] = ag.build_agent(hazard, memory=True, mode="deep" if deep else "fast")
     with st.status("Agent team working...", expanded=True) as status:
-        plan_box, log_box = st.empty(), st.container()
+        plan_box, log_box, text_box = st.empty(), st.container(), st.empty()
+        acc = ""
         for ev in ag.stream_events(r["agent"], sel["id"], hazard, thread_id=r["tid"]):
             if ev["type"] == "plan":
                 r["plan"] = ev["todos"]
@@ -127,11 +154,23 @@ def start_run():
             elif ev["type"] == "tool_call" and ev["name"] != "write_todos":
                 r["lanes"].setdefault(ev["lane"], []).append(line_for(ev))
                 log_box.markdown(line_for(ev))
+            elif ev["type"] == "handoff":
+                r["handoffs"].append(ev)
+                log_box.markdown(f"{LANE_ICON.get(ev['from'], '🤖')} → {LANE_ICON.get(ev['to'], '🤖')} "
+                                 f"**{ev['from']} → {ev['to']}**")
+            elif ev["type"] == "text_delta":
+                acc += ev["text"]
+                text_box.markdown(acc)
             elif ev["type"] == "usage":
                 r["tokens"][0] += ev["input"]; r["tokens"][1] += ev["output"]
             elif ev["type"] == "text":
                 r["report"] = ev["text"]
-        status.update(label="Done", state="complete", expanded=False)
+        r["plan"] = [dict(t, status="completed") for t in r["plan"]]
+        if not deep and r["report"]:  # instant, no-LLM review: every number must be in the evidence
+            rv = ag.code_review(sel["id"], r["report"])
+            r["handoffs"].append({"from": "reviewer", "to": "orchestrator", "text": json.dumps(rv)})
+        r["seconds"] = round(time.time() - t0, 1)
+        status.update(label=f"Done in {r['seconds']}s", state="complete", expanded=False)
     OUT_DIR.mkdir(exist_ok=True)
     (OUT_DIR / f"report_{sel['id']}.md").write_text(r["report"])
     return r
@@ -212,8 +251,10 @@ with rail:
 # ---------------- right: tabs ----------------
 with main:
     st.subheader(f"{sel['name']} · {sel['type']} · #{sel['id']}")
-    t_stakes, t_out, t_in, t_rep, t_team, t_ask = st.tabs(
-        ["Stakes", "Outside", "Inside", "Report", "Agent team", "Ask"])
+    names = ["Report", "Stakes", "Outside", "Inside", "Agent team", "Ask"] if run else \
+            ["Stakes", "Report", "Outside", "Inside", "Agent team", "Ask"]
+    tabs = dict(zip(names, st.tabs(names)))
+    t_stakes, t_rep, t_out, t_in, t_team, t_ask = (tabs[n] for n in ("Stakes", "Report", "Outside", "Inside", "Agent team", "Ask"))
 
     with t_stakes:
         st.map([{"lat": sel["lat"], "lon": sel["lon"]}], zoom=14, height=220)
@@ -259,7 +300,7 @@ with main:
     with t_in:
         inner = view and view["interior"]
         if inner and inner.get("status") == "ok":
-            st.caption("A vision model reads these images, then a second skeptical pass must confirm every 'seen' item "
+            st.caption("A cheap model (Haiku) reads these images, then a stronger model (Sonnet) must confirm every 'seen' item "
                        "(otherwise it is downgraded to cannot_tell). Observations are uncertain; 'not_seen' is not proof an "
                        "item is absent. The sprinkler reading is unreliable and not scored (CoStar is used for sprinklers).")
             cols = st.columns(3)
@@ -277,6 +318,9 @@ with main:
 
     with t_rep:
         if run and run["report"]:
+            if run.get("seconds"):
+                st.caption(f"{'Deep' if run.get('deep') else 'Fast'} mode · {run['seconds']}s · "
+                           f"{run['tokens'][0]:,} in / {run['tokens'][1]:,} out tokens")
             st.markdown(run["report"])
             st.download_button("Download report (.md)", run["report"], file_name=f"report_{run['bid']}.md")
         else:
@@ -284,16 +328,36 @@ with main:
 
     with t_team:
         if run:
-            cols = st.columns(4)
-            for col, lane in zip(cols, ["orchestrator", "exterior-analyst", "interior-inspector", "stakes-analyst"]):
-                with col:
-                    st.markdown(f"##### {LANE_ICON[lane]} {lane}")
-                    for line in run["lanes"].get(lane, []):
+            st.caption("The real messages agents sent each other. Opening a bubble shows the full text.")
+            for h in run.get("handoffs", []):
+                with st.chat_message(h["from"], avatar=LANE_ICON.get(h["from"], "🤖")):
+                    st.markdown(f"**{h['from']} → {h['to']}**")
+                    txt = h["text"]
+                    if h["from"] == "reviewer":
+                        try:
+                            rv = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
+                            badge = "✅ pass" if rv.get("verdict") == "pass" else "⚠️ revise"
+                            st.markdown(f"{badge} · {rv.get('numbers_checked', '?')} numbers checked · "
+                                        f"{len(rv.get('issues', []))} issue(s)")
+                            for iss in rv.get("issues", []):
+                                st.markdown(f"- ~~{iss.get('claim', '')[:120]}~~  \n  {iss.get('problem', '')[:220]}")
+                            txt = None
+                        except Exception:
+                            pass
+                    if txt:
+                        st.markdown(txt[:260] + ("..." if len(txt) > 260 else ""))
+                        if len(txt) > 260:
+                            with st.expander("Full message"):
+                                st.markdown(txt)
+            with st.expander("Plan and tool calls by agent"):
+                st.markdown(plan_md(run["plan"]))
+                for lane, lines in run["lanes"].items():
+                    st.markdown(f"**{LANE_ICON.get(lane, '🤖')} {lane}**")
+                    for line in lines:
                         st.markdown(line.split("·", 1)[1] if "·" in line else line)
-            st.markdown("**Plan**\n" + plan_md(run["plan"]))
-            st.caption(f"Tokens so far: {run['tokens'][0]:,} in / {run['tokens'][1]:,} out (all lanes).")
+            st.caption(f"Tokens so far: {run['tokens'][0]:,} in / {run['tokens'][1]:,} out (all agents).")
         else:
-            st.info("Live lanes for the orchestrator and three specialist subagents appear after Investigate.")
+            st.info("The agents' messages to each other appear here after Investigate.")
 
     with t_ask:
         if not run:
@@ -314,6 +378,8 @@ with main:
                             for ev in events:
                                 if ev["type"] == "text":
                                     ans = ev["text"]
+                                elif ev["type"] == "handoff":
+                                    run.setdefault("handoffs", []).append(ev)
                                 elif ev["type"] == "usage":
                                     run["tokens"][0] += ev["input"]; run["tokens"][1] += ev["output"]
                                 elif ev["type"] == "interrupt":
@@ -334,11 +400,26 @@ with main:
                     st.rerun()
 
             st.markdown("**One-click jobs**")
-            bcols = st.columns(len(QUICK))
+            bcols = st.columns(len(QUICK) + 1)
             queued = None
             for col, (label, prompt) in zip(bcols, QUICK.items()):
                 if col.button(label, key=f"q_{label}", width="stretch"):
                     queued = prompt
+            if bcols[-1].button("Stress-test the reviewer", key="q_stress", width="stretch",
+                                help="Plants errors on purpose to show the reviewer catching them. A test, not a real finding."):
+                if run.get("deep"):
+                    queued = STRESS_LLM
+                else:  # instant, no LLM: alter the real report, then run the same code check
+                    sc0 = scoring.score(ag.get_facts(run["bid"]))["score"]
+                    planted = run["report"].replace(f"{sc0}/100", "41/100", 1) + " Zone 1 tree cover is 63%."
+                    rv = ag.code_review(run["bid"], planted)
+                    run["handoffs"] += [
+                        {"from": "test harness", "to": "reviewer", "text": "PLANTED ERRORS (a test): score changed to 41/100 and "
+                         "'zone 1 tree cover is 63%' added to the real report."},
+                        {"from": "reviewer", "to": "test harness", "text": json.dumps(rv)}]
+                    caught = [i["problem"] for i in rv["issues"]]
+                    st.warning(f"TEST (planted errors): the code reviewer flagged {len(caught)} number(s): "
+                               + "; ".join(caught) + ". It checks numbers only; wording errors need Deep mode.")
 
             if run["pending"]:
                 st.warning("The agent wants to save this draft. Review it first.")
