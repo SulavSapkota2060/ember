@@ -61,6 +61,27 @@ def get_stakes(building_id: int) -> str:
     that are None are not recorded by CoStar; never estimate them."""
     return json.dumps(costar.get_stakes(building_id))
 
+def get_facts(building_id) -> dict:
+    """Scoring facts for a building (used by the UI for instant what-if). Builds them if score_risk has not run."""
+    c = _ctx(building_id)
+    if "facts" not in c:
+        c["facts"] = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"))
+    return c["facts"]
+
+def what_if(building_id: int, fix_ids: list[str]) -> str:
+    """Re-score the building as if the given fixes were done. fix_ids come from score_risk's ranked_fixes
+    (ids like clear_zone1, screen_vents). Returns before/after score and which factors moved. Code, not judgement."""
+    bad = [i for i in fix_ids if i not in scoring.FIXES]
+    if bad:
+        return json.dumps({"error": f"unknown fix ids {bad}", "valid": list(scoring.FIXES)})
+    return json.dumps(scoring.whatif(get_facts(building_id), fix_ids))
+
+def plan_budget(building_id: int, budget: float, costs: dict[str, float]) -> str:
+    """Best set of fixes within a budget. `costs` maps fix id -> dollars and MUST come from the user; never
+    invent prices. Fixes without a user cost are returned in skipped_no_cost."""
+    return json.dumps(scoring.plan_within_budget(get_facts(building_id), float(budget),
+                                                 {k: float(v) for k, v in costs.items()}))
+
 def get_hazard_zone(building_id: int) -> str:
     """Official hazard-zone lookup. May return status 'unavailable': then say so and score from imagery."""
     p = _ctx(building_id)["prop"]
@@ -71,7 +92,7 @@ def draft_action(building_id: int, subject: str, body: str) -> str:
     return actions.write_action_draft(building_id, subject, body)
 
 TOOLS = [get_property, get_parcel_attributes, get_aerial, detect_hazard_features, get_hazard_zone,
-         get_stakes, score_risk, draft_action]
+         get_stakes, score_risk, what_if, plan_budget, draft_action]
 
 SYSTEM = """You are Ember, a hazard-readiness analyst for commercial buildings.
 {hazard_prompt}
@@ -85,13 +106,16 @@ by score_risk (and callout numbers when relevant); (2) fix list taken from score
 its points_removed written as "-N points" (a reduction, never "+N") and relative cost (low/med/high), no dollar figures unless the user gave a budget;
 (3) what is at stake, from get_stakes (tenants, known employees, last sale with its price status; say
 "not recorded" for None values, never estimate); (4) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
+Follow-up questions: use what_if for "what if I do X" and plan_budget for budget questions (ask the user for
+per-fix dollar costs if they gave none; never invent prices). Quote results exactly; deltas are reductions
+("-N points"). Keep answers short.
 Rules: the score is a transparent heuristic, not a validated model. Never invent data a tool did not
 return. Do not state distances or units for defensible-space zones (the data does not define them): say
 "zone 1 (nearest the building)" and quote the percentages as given. The roof condition value has an
 undocumented scale: do not interpret it. Images are shown to the user by the app; you cannot open image
 files, so do not try to read them. If a tool result says mock, state that."""
 
-def build_agent(hazard: str):
+def build_agent(hazard: str, memory: bool = False):
     if not LLM_MODEL:
         raise RuntimeError("LLM_MODEL not set in .env (format 'provider:model'). Provider undecided.")
     global _HAZARD
@@ -99,13 +123,18 @@ def build_agent(hazard: str):
     costar._props(); costar._models()  # warm the cache once, before parallel tool threads
     from deepagents import create_deep_agent
     from langchain.agents.middleware import TodoListMiddleware  # not in deepagents 0.7.x defaults; powers the live plan
+    kw = {}
+    if memory:  # keeps the conversation per thread_id so follow-up chat has context
+        from langgraph.checkpoint.memory import InMemorySaver
+        kw["checkpointer"] = InMemorySaver()
     return create_deep_agent(model=LLM_MODEL, tools=TOOLS, middleware=[TodoListMiddleware()],
-                             system_prompt=SYSTEM.format(hazard_prompt=HAZARDS[hazard]["prompt"]))
+                             system_prompt=SYSTEM.format(hazard_prompt=HAZARDS[hazard]["prompt"]), **kw)
 
-def stream_events(agent, building_id: int, hazard: str, user_msg: str | None = None):
+def stream_events(agent, building_id: int, hazard: str, user_msg: str | None = None, thread_id: str | None = None):
     """Yield UI events: {'type': 'plan'|'tool_call'|'tool_result'|'text', ...}."""
     msg = user_msg or f"Assess {hazard} readiness for building_id={building_id}."
-    for chunk in agent.stream({"messages": [{"role": "user", "content": msg}]}, stream_mode="updates"):
+    cfg = {"configurable": {"thread_id": thread_id}} if thread_id else None
+    for chunk in agent.stream({"messages": [{"role": "user", "content": msg}]}, config=cfg, stream_mode="updates"):
         for _node, upd in (chunk or {}).items():
             if not isinstance(upd, dict):
                 continue
@@ -121,4 +150,4 @@ def stream_events(agent, building_id: int, hazard: str, user_msg: str | None = N
                     if txt.strip() and not getattr(m, "tool_calls", None):
                         yield {"type": "text", "text": txt}
                 elif kind == "tool":
-                    yield {"type": "tool_result", "name": m.name, "content": str(m.content)[:2000]}
+                    yield {"type": "tool_result", "name": m.name, "content": str(m.content)[:20000 if m.name == "detect_hazard_features" else 2000]}

@@ -201,7 +201,9 @@ def _f_roof(f): f.update(roof_material="tile", roof_missing=False, roof_structur
                           roof_patch=False, roof_debris=False, roof_discolor_pct=0.0)
 def _f_debris(f): f["roof_debris"] = False
 def _f_wood(f): f.update(deck=False, wood_n=0)
-def _f_sprinklers(f): f["sprinklers"] = True
+def _f_sprinklers(f):
+    if f.get("sprinklers") is False:  # unknown (None) stays unknown: no fix is claimed
+        f["sprinklers"] = True
 def _f_brush(f): f["dry_brush_n"] = 0
 
 # cost is RELATIVE (low/med/high). No dollar figures: the user supplies those.
