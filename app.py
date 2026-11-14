@@ -50,6 +50,116 @@ def note_event(r, ev):
         lt[0] += ev["input"]; lt[1] += ev["output"]
 
 
+BAND_COLOR = {"low": "#2e9e5b", "moderate": "#d99a1c", "high": "#d64545"}
+CARBON_COLOR = {"low": "#2e9e5b", "med": "#d99a1c", "high": "#d64545"}
+
+
+def badge(text, bg):
+    return (f'<span style="background:{bg};color:#fff;padding:3px 11px;border-radius:12px;font-size:0.85rem;'
+            f'margin:0 6px 6px 0;display:inline-block">{text}</span>')
+
+
+def gauge(score, base=None):
+    """0-100 bar split into the three bands, with a marker at the score (and a ghost marker at the pre-fix score)."""
+    import pandas as pd
+    bands = pd.DataFrame({"a": [0, 33, 66], "b": [33, 66, 100], "c": [BAND_COLOR["low"], BAND_COLOR["moderate"], BAND_COLOR["high"]]})
+    layers = [alt.Chart(bands).mark_bar(height=16, opacity=0.85).encode(
+        x=alt.X("a:Q", scale=alt.Scale(domain=[0, 100]), axis=alt.Axis(values=[0, 33, 66, 100], title=None, labelColor="#9aa0a6")),
+        x2="b:Q", color=alt.Color("c:N", scale=None))]
+    if base is not None and base != score:
+        layers.append(alt.Chart(pd.DataFrame({"s": [base]})).mark_rule(color="#9aa0a6", strokeDash=[3, 3], strokeWidth=2).encode(x="s:Q"))
+    layers.append(alt.Chart(pd.DataFrame({"s": [score]})).mark_rule(color="#ffffff", strokeWidth=5).encode(x="s:Q"))
+    return alt.layer(*layers).properties(height=44)
+
+
+def fix_help(r):
+    return f"{r['label']}. Cost {r['cost']}, carbon {r['carbon']} (our heuristic, not sourced)." + (f" Tradeoff: {r['tradeoff']}." if r.get("tradeoff") else "")
+
+
+def summary_card(bid, facts, ranked):
+    """The report at a glance: three icon panels and a chart of what moves the score. Text lives in the expander below."""
+    import pandas as pd
+    stk = costar.get_stakes(bid)
+    cs = sustainability.carbon_at_stake(costar.get_property(bid).get("gba_sqft"))
+    q = ag.get_equity(bid)
+    inner = ag.get_view(bid)["interior"]
+    z = facts.get("zone_hazard") or {}
+    c1, c2, c3 = st.columns(3)
+    with c1.container(border=True):
+        st.markdown("**🛰️ Outside**")
+        st.markdown(f"**{z['class'] + ' fire zone' if z.get('in_zone') else 'Outside mapped fire zone'}**" if z.get("status") == "ok" else "**Zone unavailable**")
+        st.caption(f"Tree cover, zone 1: {facts.get('z1t')}%  \nRoof: {facts.get('roof_material') or 'unknown'}"
+                   + (f"  \n{facts.get('roof_vents')} unscreened roof vents" if facts.get("roof_vents") else ""))
+    with c2.container(border=True):
+        st.markdown("**🏢 Inside**")
+        if inner.get("status") == "ok":
+            obs = inner["observations"]
+            seen = [k.replace("_", " ") for k, o in obs.items() if o["status"] == "seen"]
+            tell = [k.replace("_", " ") for k, o in obs.items() if o["status"] == "cannot_tell"]
+            st.markdown(f"**{len(seen)} of {len(obs)} items confirmed**")
+            st.caption(f"Seen: {', '.join(seen) or 'none'}  \nCan't tell: {', '.join(tell) or 'none'}")
+        else:
+            st.markdown("**Interior unavailable**")
+    with c3.container(border=True):
+        st.markdown("**👥 People and carbon**")
+        emp = stk["employees_known"]
+        st.markdown(f"**{stk['tenant_count']} tenants" + (f" · {emp:,}+ employees**" if emp else "**"))
+        st.caption((f"{cs['tonnes_co2e']:,} t CO2e at stake  \n" if cs else "") +
+                   (f"Neighborhood burden: {equity.ordinal(q['burden_percentile'])} pct" if q.get("status") == "ok" else "Neighborhood burden: unavailable"))
+    if ranked:
+        top = pd.DataFrame([{"fix": r["short"], "points removed": r["points_removed"], "carbon of the work": r["carbon"]} for r in ranked[:5]])
+        chart = alt.Chart(top).mark_bar().encode(
+            y=alt.Y("fix:N", sort="-x", title=None),
+            x=alt.X("points removed:Q", title="Exposure points removed by this fix alone"),
+            color=alt.Color("carbon of the work:N", scale=alt.Scale(domain=["low", "med", "high"], range=[CARBON_COLOR["low"], CARBON_COLOR["med"], CARBON_COLOR["high"]]),
+                            legend=alt.Legend(orient="bottom", title="Carbon of doing the work (our heuristic)")),
+            tooltip=["fix", "points removed", "carbon of the work"]).properties(height=34 * len(top) + 30)
+        st.altair_chart(chart, width="stretch")
+
+
+
+NODE_COLOR = {"orchestrator": "#3b6fd4", "exterior-analyst": "#2e8b8b", "interior-inspector": "#8e5bd4", "stakes-analyst": "#c9791f",
+              "reviewer": "#c0392b"}
+
+
+def flow_dot(run):
+    """Who talked to whom, with timing, verdicts and tokens, as a graph. Built only from the real handoffs of this run."""
+    hs = run.get("handoffs", [])[:14]
+    names = []
+    for h in hs:
+        for n in (h["from"], h["to"]):
+            if n not in names:
+                names.append(n)
+    tok = run.get("lane_tokens", {})
+    verdict = {}
+    for h in hs:
+        if h["from"] == "reviewer":
+            try:
+                rv = json.loads(h["text"][h["text"].index("{"): h["text"].rindex("}") + 1])
+                verdict["reviewer"] = (("✓ pass" if rv.get("verdict") == "pass" else "! revise") +
+                                       f" · {rv.get('numbers_checked', '?')} numbers" + (f" · {len(rv['issues'])} issues" if rv.get("issues") else ""))
+            except Exception:
+                pass
+    lines = ['digraph G {', 'rankdir=LR; bgcolor="transparent"; nodesep=0.35; ranksep=0.9;',
+             'node [shape=box, style="rounded,filled", fontname="Helvetica", fontcolor="white", fontsize=12, margin="0.18,0.1"];',
+             'edge [color="#9aa0a6", fontcolor="#cfd3d7", fontname="Helvetica", fontsize=10];']
+    for n in names:
+        extra = []
+        if n in verdict:
+            extra.append(verdict[n])
+        if n in tok:
+            extra.append(f"{(tok[n][0] + tok[n][1]) / 1000:.1f}k tokens")
+        label = n + ("\\n" + " · ".join(extra) if extra else "")
+        lines.append(f'"{n}" [label="{label}", fillcolor="{NODE_COLOR.get(n, "#5d6d7e")}"];')
+    for h in hs:
+        kind = "task" if h["from"] == "orchestrator" else "report"
+        t = f" @ {h['t']}s" if h.get("t") is not None else ""
+        lines.append(f'"{h["from"]}" -> "{h["to"]}" [label="{kind}{t}"];')
+    lines.append("}")
+    return "\n".join(lines)
+
+
+
 def line_for(ev):
     return f"{LANE_ICON.get(ev['lane'], '🤖')} **{ev['lane']}** · `{ev['name']}` {json.dumps(ev['args'])[:100]}"
 
@@ -180,7 +290,7 @@ def start_run():
             elif ev["type"] == "thinking":
                 log_box.markdown(f"💭 **{ev['lane']}** · reasoning summary: _{ev['text'][:220].strip()}..._")
             elif ev["type"] == "handoff":
-                r["handoffs"].append(ev)
+                r["handoffs"].append({**ev, "t": round(time.time() - t0, 1)})
                 log_box.markdown(f"{LANE_ICON.get(ev['from'], '🤖')} → {LANE_ICON.get(ev['to'], '🤖')} "
                                  f"**{ev['from']} → {ev['to']}**")
             elif ev["type"] == "text_delta":
@@ -193,7 +303,7 @@ def start_run():
         r["plan"] = [dict(t, status="completed") for t in r["plan"]]
         if not deep and r["report"]:  # instant, no-LLM review: every number must be in the evidence
             rv = ag.code_review(sel["id"], r["report"])
-            r["handoffs"].append({"from": "reviewer", "to": "orchestrator", "text": json.dumps(rv)})
+            r["handoffs"].append({"from": "reviewer", "to": "orchestrator", "text": json.dumps(rv), "t": round(time.time() - t0, 1)})
         r["seconds"] = round(time.time() - t0, 1)
         status.update(label=f"Done in {r['seconds']}s", state="complete", expanded=False)
     OUT_DIR.mkdir(exist_ok=True)
@@ -230,16 +340,22 @@ with rail:
         st.metric("Fire exposure score (ESTIMATE, lower is better)", f"{after['score']} / 100",
                   help="0-100 where HIGHER means MORE exposed. Fixes lower the score. Heuristic estimate, not a validated model.",
                   delta=f"{after['score'] - base['score']} pts vs. now" if chosen else None, delta_color="inverse")
+        st.altair_chart(gauge(after["score"], base["score"] if chosen else None), width="stretch")
         z = facts.get("zone_hazard") or {}
-        if z.get("status") == "ok":
-            zone_txt = f"CAL FIRE zone: **{z['class']}**" if z.get("in_zone") else "outside CAL FIRE mapped zones (older maps)"
+        if z.get("status") == "ok" and z.get("in_zone"):
+            zone_b = badge(f"🔥 CAL FIRE: {z['class']}", "#c0392b")
+        elif z.get("status") == "ok":
+            zone_b = badge("Outside mapped fire zone", "#5d6d7e")
         else:
-            zone_txt = "CAL FIRE zone: unavailable"
+            zone_b = badge("Zone unavailable", "#5d6d7e")
         q = ag.get_equity(bid)
-        hood_txt = (f"Neighborhood burden: **{equity.ordinal(q['burden_percentile'])} percentile** (CalEnviroScreen 4.0)"
-                    if q.get("status") == "ok" else "Neighborhood burden: unavailable")
-        st.markdown(f"Band: **{after['band']}**" + (f" (now {base['score']}, {base['band']})" if chosen else "")
-                    + f"  \n{zone_txt}  \n{hood_txt}")
+        if q.get("status") == "ok":
+            p = q["burden_percentile"]
+            hood_b = badge(f"🏘 Burden {equity.ordinal(p)} pct", "#c0392b" if p >= 75 else "#d68910" if p >= 50 else "#5d6d7e")
+        else:
+            hood_b = badge("Burden unavailable", "#5d6d7e")
+        st.markdown(badge(f"Band: {after['band']}" + (f" (was {base['band']})" if chosen and base["band"] != after["band"] else ""),
+                          BAND_COLOR[after["band"]]) + zone_b + hood_b, unsafe_allow_html=True)
         with st.expander("Factor breakdown"):
             for f in after["factors"]:
                 st.caption(f"{f['label']}: {f['points']} pts")
@@ -248,7 +364,7 @@ with rail:
                 st.caption("Not scored: " + ", ".join(m["factor"] for m in after["missing"]))
         st.markdown("**What-if: tick fixes** (the agent can tick these too)")
         for r in ranked:
-            st.checkbox(f"{r['label']} · cost {r['cost']} · carbon {r['carbon']} · −{r['points_removed']} pts alone", key=f"fix_{bid}_{r['id']}")
+            st.checkbox(f"{r['short']} · −{r['points_removed']} pts", key=f"fix_{bid}_{r['id']}", help=fix_help(r))
         if not ranked:
             st.info("No modelled fix changes this building's score.")
         with st.expander("Carbon-smart ranking: exposure removed per carbon spent"):
@@ -365,34 +481,40 @@ with main:
             if run.get("seconds"):
                 st.caption(f"{'Deep' if run.get('deep') else 'Fast'} mode · {run['seconds']}s · "
                            f"{run['tokens'][0]:,} in / {run['tokens'][1]:,} out tokens")
-            st.markdown(run["report"])
-            st.download_button("Download report (.md)", run["report"], file_name=f"report_{run['bid']}.md")
+            summary_card(run["bid"], facts, ranked)
+            with st.expander("Read the full agent report"):
+                st.markdown(run["report"])
+                st.download_button("Download report (.md)", run["report"], file_name=f"report_{run['bid']}.md")
         else:
             st.info("The agent's report appears here.")
 
     with t_team:
         if run:
-            st.caption("The real messages agents sent each other. Opening a bubble shows the full text.")
-            for h in run.get("handoffs", []):
-                with st.chat_message(h["from"], avatar=LANE_ICON.get(h["from"], "🤖")):
-                    st.markdown(f"**{h['from']} → {h['to']}**")
-                    txt = h["text"]
-                    if h["from"] == "reviewer":
-                        try:
-                            rv = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
-                            badge = "✅ pass" if rv.get("verdict") == "pass" else "⚠️ revise"
-                            st.markdown(f"{badge} · {rv.get('numbers_checked', '?')} numbers checked · "
-                                        f"{len(rv.get('issues', []))} issue(s)")
-                            for iss in rv.get("issues", []):
-                                st.markdown(f"- ~~{iss.get('claim', '')[:120]}~~  \n  {iss.get('problem', '')[:220]}")
-                            txt = None
-                        except Exception:
-                            pass
-                    if txt:
-                        st.markdown(txt[:260] + ("..." if len(txt) > 260 else ""))
-                        if len(txt) > 260:
-                            with st.expander("Full message"):
-                                st.markdown(txt)
+            if run.get("handoffs"):
+                st.graphviz_chart(flow_dot(run), width="stretch")
+                st.caption("Who talked to whom in this run: arrows are real messages, with the time each was sent. "
+                           "Reviewer shows its verdict; every agent shows the tokens it used.")
+            with st.expander("Messages between agents", expanded=False):
+              for h in run.get("handoffs", []):
+                  with st.chat_message(h["from"], avatar=LANE_ICON.get(h["from"], "🤖")):
+                      st.markdown(f"**{h['from']} → {h['to']}**")
+                      txt = h["text"]
+                      if h["from"] == "reviewer":
+                          try:
+                              rv = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
+                              verdict_txt = "✅ pass" if rv.get("verdict") == "pass" else "⚠️ revise"
+                              st.markdown(f"{verdict_txt} · {rv.get('numbers_checked', '?')} numbers checked · "
+                                          f"{len(rv.get('issues', []))} issue(s)")
+                              for iss in rv.get("issues", []):
+                                  st.markdown(f"- ~~{iss.get('claim', '')[:120]}~~  \n  {iss.get('problem', '')[:220]}")
+                              txt = None
+                          except Exception:
+                              pass
+                      if txt:
+                          st.markdown(txt[:260] + ("..." if len(txt) > 260 else ""))
+                          if len(txt) > 260:
+                              with st.expander("Full message"):
+                                  st.markdown(txt)
             evs = run.get("events", [])
             if evs:
                 with st.expander(f"Agent activity ({len(evs)} steps)", expanded=bool(run.get("deep"))):
@@ -446,7 +568,7 @@ with main:
                                 if ev["type"] == "text":
                                     ans = ev["text"]
                                 elif ev["type"] == "handoff":
-                                    run.setdefault("handoffs", []).append(ev)
+                                    run.setdefault("handoffs", []).append({**ev, "t": round(time.time() - run["t0"], 1)})
                                 elif ev["type"] == "usage":
                                     run["tokens"][0] += ev["input"]; run["tokens"][1] += ev["output"]
                                 elif ev["type"] == "interrupt":

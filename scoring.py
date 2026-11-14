@@ -272,6 +272,10 @@ FIXES = {
     "add_extinguishers": ("Place/verify fire extinguishers (none seen in Matterport images)", "low", _f_extinguishers),
 }
 _COST_RANK = {"low": 1, "med": 2, "high": 3}
+FIX_SHORT = {"clear_zone1": "Clear zone 1 trees", "thin_zone2": "Thin zone 2 trees", "screen_vents": "Screen roof vents",
+             "replace_roof": "Replace roof", "clear_roof_debris": "Clear roof debris", "replace_wood": "Replace wood decks",
+             "add_sprinklers": "Add sprinklers", "clear_dry_brush": "Clear dry brush", "clear_egress": "Clear blocked exits",
+             "clear_stored_combustibles": "Remove stored combustibles", "add_extinguishers": "Add extinguishers"}
 
 # HEURISTIC (ours, NOT sourced): relative embodied-carbon footprint of doing the work: low = labour and small parts,
 # med = new building materials, high = major new materials/equipment. Used only to rank fixes by exposure removed per
@@ -308,7 +312,7 @@ def rank_fixes(facts: dict) -> list[dict]:
     for fid, (label, cost, _fn) in FIXES.items():
         d = base - score(apply_fixes(facts, [fid]))["score"]
         if d > 0:
-            rows.append({"id": fid, "label": label, "cost": cost, "carbon": FIX_CARBON.get(fid, "med"),
+            rows.append({"id": fid, "label": label, "short": FIX_SHORT.get(fid, label), "cost": cost, "carbon": FIX_CARBON.get(fid, "med"),
                          "tradeoff": FIX_TRADEOFF.get(fid), "points_removed": d})
     rows.sort(key=lambda r: -(r["points_removed"] / _COST_RANK[r["cost"]]))
     return rows

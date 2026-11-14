@@ -2,8 +2,8 @@
 
 HackPrinceton F26 (Sustainability track; CoStar, LangChain deepagents and Amazon practical-AI side tracks).
 
-Wildfire risk is rising and most of the built environment is not retrofitted for it. Ember is an AI agent team that looks at a
-commercial building **from outside (Vexcel aerial data) and inside (Matterport interiors)**, says **what is at stake (CoStar)**
+Wildfires can reach commercial buildings, and a loss displaces tenants and forces a rebuild that re-emits the building's
+embodied carbon. Ember is an AI agent team that looks at a commercial building **from outside (Vexcel aerial data) and inside (Matterport interiors)**, says **what is at stake (CoStar)**
 and which fixes buy the most protection, and lets an owner test them live. Protecting an existing building avoids loss,
 tenant displacement and rebuilding, and a rebuild re-emits the upfront embodied carbon.
 
@@ -52,6 +52,14 @@ In both modes **the score is computed by code, never by the LLM.** Drafts (e.g. 
 - Vision readings of interiors are uncertain even with the second look.
 - The CoStar kit is read locally and is not redistributed in this repo.
 
+## What we built vs. what we used
+**Written by us during the event (Nov 13-15, 2026):** all application code in this repo. Notably the exposure scoring heuristic and fix
+catalog (`scoring.py`), the agent design in both modes, the parallel workers, the number-checking reviewer and its tests (`agent.py`,
+`review.py`), the Haiku-then-Sonnet interior reading with a second look (`tools/interior.py`), the carbon-at-stake calculation
+(`sustainability.py`), the equity lens (`equity.py`), the portfolio view (`portfolio.py`) and the Streamlit interface (`app.py`).
+**Used, not written by us:** the libraries, models and datasets credited below. Developed with Claude Code (Anthropic) under the
+author's direction; the author is responsible for the design decisions described here.
+
 ## Sources and credits
 **Data**
 - **CoStar:** hackathon data kit (commercial property, tenancy/location-occupancy, company detail and sale-comp records). Not redistributed.
@@ -77,8 +85,6 @@ In both modes **the score is computed by code, never by the LLM.** Drafts (e.g. 
   human-in-the-loop approvals); `langchain-anthropic`.
 - Anthropic Claude models (Sonnet 5.5 and Haiku 5.5) for the agents and the interior image reading.
 - Streamlit, Altair, pandas, Pillow, Requests, python-dotenv and Shapely.
-
-**Built with AI assistance:** written during HackPrinceton F26 (Nov 13-15, 2026) with Claude Code (Anthropic), under the author's direction.
 
 Names of companies and agencies are used only to attribute data. This project is not affiliated with or endorsed by CoStar, Vexcel,
 Matterport, CAL FIRE, OEHHA, the Carbon Leadership Forum, Anthropic or LangChain.
