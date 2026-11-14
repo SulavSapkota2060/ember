@@ -273,6 +273,16 @@ FIXES = {
 }
 _COST_RANK = {"low": 1, "med": 2, "high": 3}
 
+# HEURISTIC (ours, NOT sourced): relative embodied-carbon footprint of doing the work: low = labour and small parts,
+# med = new building materials, high = major new materials/equipment. Used only to rank fixes by exposure removed per
+# carbon spent ("don't burn carbon to save carbon"). No tonnage is implied.
+FIX_CARBON = {"clear_zone1": "low", "thin_zone2": "low", "screen_vents": "low", "replace_roof": "high",
+              "clear_roof_debris": "low", "replace_wood": "med", "add_sprinklers": "high", "clear_dry_brush": "low",
+              "clear_egress": "low", "clear_stored_combustibles": "low", "add_extinguishers": "low"}
+# Plain side effects of the fix itself (not estimates).
+FIX_TRADEOFF = {"clear_zone1": "removes tree cover near the building (shade, habitat)",
+                "thin_zone2": "removes some tree cover (shade, habitat)"}
+
 
 def apply_fixes(facts: dict, fix_ids) -> dict:
     out = copy.deepcopy(facts)
@@ -298,9 +308,19 @@ def rank_fixes(facts: dict) -> list[dict]:
     for fid, (label, cost, _fn) in FIXES.items():
         d = base - score(apply_fixes(facts, [fid]))["score"]
         if d > 0:
-            rows.append({"id": fid, "label": label, "cost": cost, "points_removed": d})
+            rows.append({"id": fid, "label": label, "cost": cost, "carbon": FIX_CARBON.get(fid, "med"),
+                         "tradeoff": FIX_TRADEOFF.get(fid), "points_removed": d})
     rows.sort(key=lambda r: -(r["points_removed"] / _COST_RANK[r["cost"]]))
     return rows
+
+
+def carbon_smart(rows: list[dict]) -> list[dict]:
+    """Same fixes ranked by points removed per relative carbon unit (low=1, med=2, high=3), best first. Adds
+    `per_carbon` and `low_payoff` (a high-carbon fix removing 3 or fewer points)."""
+    out = [dict(r, per_carbon=round(r["points_removed"] / _COST_RANK[r["carbon"]], 2),
+                low_payoff=(r["carbon"] == "high" and r["points_removed"] <= 3)) for r in rows]
+    out.sort(key=lambda r: (-r["per_carbon"], -r["points_removed"]))
+    return out
 
 
 def plan_within_budget(facts: dict, budget: float, cost_usd: dict) -> dict:

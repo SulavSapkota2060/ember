@@ -1,10 +1,12 @@
 import json, uuid
+import altair as alt
 import streamlit as st
 from config import MOCK, LLM_MODEL, OUT_DIR
 from hazards import HAZARDS
 from tools import costar
 import scoring
 import sustainability
+import portfolio
 import agent as ag
 
 st.set_page_config(page_title="Ember", layout="wide")
@@ -37,18 +39,72 @@ def line_for(ev):
 
 
 # ---------------- sidebar ----------------
+city_default, multi_default = "Los Angeles", False
+_blds_all = [b for b in costar.list_buildings(city_default, multi_default) if b["matterport"]]
+if S.get("_goto"):  # set by the portfolio view; must be applied before the widgets below exist
+    _b = next((b for b in _blds_all if b["id"] == S["_goto"]), None)
+    if _b:
+        S["bld_pick"], S["view"] = _b, "Building"
+    S["_goto"] = None
+
 with st.sidebar:
     st.title("Ember")
     st.caption("Fire exposure for commercial buildings (lower is better). Scores are heuristic ESTIMATES, not a validated model.")
+    view_mode = st.radio("View", ["Building", "Portfolio"], key="view", horizontal=True)
     hazard = st.selectbox("Hazard", list(HAZARDS), format_func=lambda k: HAZARDS[k]["label"])
     city = st.selectbox("City", ["Los Angeles", "Houston"])
     multi = st.checkbox("Include apartments", False)
     blds = [b for b in costar.list_buildings(city, multi) if b["matterport"]]
-    sel = st.selectbox("Building", blds, format_func=lambda b: f"{b['name']} ({b['type']}) #{b['id']}")
+    sel = st.selectbox("Building", blds, key="bld_pick", format_func=lambda b: f"{b['name']} ({b['type']}) #{b['id']}")
     st.write("Vexcel: **MOCK**" if MOCK else "Vexcel: live")
     if not LLM_MODEL:
         st.warning("LLM_MODEL not set in .env")
-    go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL), width="stretch")
+    go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL) or view_mode == "Portfolio", width="stretch")
+
+if view_mode == "Portfolio":
+    st.subheader("Portfolio: where would retrofit money protect the most?")
+    rows = portfolio.load()
+    if not rows:
+        st.info("Run `python scripts/build_portfolio.py` first.")
+        st.stop()
+    st.caption("Each dot is an LA building with a Matterport model. **Screening** exposure uses only the outside data "
+               "(tree cover by zone, roof material/discoloration), CoStar sprinklers/construction and the CAL FIRE zone. It has "
+               "no detections, roof-defect flags, vent counts or interior, so it differs from a full investigation (on the 4 "
+               "buildings compared it ran 1-9 points lower). Carbon is upfront embodied carbon at stake (CLF averages x CoStar "
+               "area), not a forecast. Dashed lines are portfolio medians, not danger thresholds.")
+    import pandas as pd
+    df = pd.DataFrame(rows).dropna(subset=["carbon_t"])
+    df["people"] = df["employees_known"].fillna(0) + 5
+    mx, my = float(df["screening_score"].median()), float(df["carbon_t"].median())
+    pick = alt.selection_point(name="pick", fields=["id"])
+    base = alt.Chart(df)
+    dots = base.mark_circle(opacity=0.75).encode(
+        x=alt.X("screening_score:Q", title="Screening exposure (0-100, lower is better)"),
+        y=alt.Y("carbon_t:Q", scale=alt.Scale(type="log"), title="Embodied carbon at stake (t CO2e, log scale)"),
+        size=alt.Size("people:Q", legend=None, scale=alt.Scale(range=[40, 700])),
+        color=alt.Color("zone:N", title="CAL FIRE zone", scale=alt.Scale(domain=["Very High", "High", "Moderate", "none", "unknown"],
+                        range=["#d62728", "#ff7f0e", "#f2c200", "#8a8f98", "#cccccc"])),
+        tooltip=["name", "type", "screening_score", "band", "zone", "carbon_t", "employees_known", "tenants"],
+        opacity=alt.condition(pick, alt.value(0.9), alt.value(0.55))).add_params(pick)
+    vline = base.mark_rule(strokeDash=[4, 4], color="#888").encode(x=alt.datum(mx))
+    hline = base.mark_rule(strokeDash=[4, 4], color="#888").encode(y=alt.datum(my))
+    ev = st.altair_chart(dots + vline + hline, on_select="rerun", selection_mode="pick", height=460)
+    st.caption("Dot size = known employees (CoStar; unknown shown smallest). Top-right = above both medians: high exposure and "
+               "high carbon at stake. Click a dot to select it.")
+    chosen_ids = [p["id"] for p in (ev.selection.get("pick") or [])] if ev and getattr(ev, "selection", None) else []
+    if chosen_ids:
+        r = df[df["id"] == chosen_ids[0]].iloc[0]
+        st.markdown(f"**{r['name']}** · {r['type']} · screening exposure {r['screening_score']} ({r['band']}) · zone: {r['zone']} · "
+                    f"{r['carbon_t']:,.0f} t CO2e at stake · employees known: {nr(r['employees_known'])}")
+        if st.button("Open in Building view and investigate", type="primary"):
+            S["_goto"] = int(r["id"])
+            st.rerun()
+    top = df[(df["screening_score"] > mx) & (df["carbon_t"] > my)].sort_values("screening_score", ascending=False)
+    st.markdown(f"#### Above both medians ({len(top)} of {len(df)})")
+    st.dataframe(top[["name", "type", "screening_score", "zone", "carbon_t", "employees_known", "tenants"]]
+                 .rename(columns={"screening_score": "screening exposure", "carbon_t": "carbon at stake (t)"}),
+                 hide_index=True, width="stretch")
+    st.stop()
 
 if not sel:
     st.stop()
@@ -124,9 +180,17 @@ with rail:
                 st.caption("Not scored: " + ", ".join(m["factor"] for m in after["missing"]))
         st.markdown("**What-if: tick fixes** (the agent can tick these too)")
         for r in ranked:
-            st.checkbox(f"{r['label']} · cost {r['cost']} · −{r['points_removed']} pts alone", key=f"fix_{bid}_{r['id']}")
+            st.checkbox(f"{r['label']} · cost {r['cost']} · carbon {r['carbon']} · −{r['points_removed']} pts alone", key=f"fix_{bid}_{r['id']}")
         if not ranked:
             st.info("No modelled fix changes this building's score.")
+        with st.expander("Carbon-smart ranking: exposure removed per carbon spent"):
+            st.caption("Carbon tags are OUR heuristic (low/med/high relative footprint of the work), not sourced figures. "
+                       "'Low payoff' = a high-carbon fix that removes 3 or fewer points.")
+            cs_rows = scoring.carbon_smart(ranked)
+            st.dataframe([{"Fix": x["label"], "Points removed": x["points_removed"], "Carbon": x["carbon"], "Cost": x["cost"],
+                           "Points per carbon unit": x["per_carbon"],
+                           "Note": ("low payoff for its carbon" if x["low_payoff"] else x["tradeoff"] or "")} for x in cs_rows],
+                         hide_index=True, width="stretch")
         with st.expander("Budget planner (you supply the costs; nothing is invented)"):
             budget = st.number_input("Budget ($)", min_value=0, step=500, value=0, key=f"bud_{bid}")
             costs = {}

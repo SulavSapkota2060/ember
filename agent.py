@@ -156,7 +156,9 @@ estimate a score yourself.
 Report format: (1) exposure score 0-100 labelled ESTIMATE (higher = more exposed, lower is better; never call it a
 "readiness" score) with 3-5 reasons that cite the evidence strings returned
 by score_risk (and callout numbers when relevant); (2) fix list taken from score_risk's ranked_fixes, with
-its points_removed written as "-N points" (a reduction, never "+N") and relative cost (low/med/high), no dollar figures unless the user gave a budget;
+its points_removed written as "-N points" (a reduction, never "+N"), relative cost (low/med/high) and relative carbon tag
+(our heuristic, not sourced; call a high-carbon fix removing 3 or fewer points "low payoff for its carbon", and mention a
+fix's tradeoff text if present), no dollar figures unless the user gave a budget;
 (3) what is at stake, from get_stakes (tenants, known employees, last sale with its price status; say
 "not recorded" for None values, never estimate); (4) interior: what get_interior saw, as uncertain image readings (say not_seen is not proof of absence; if its
 status is not ok, say why); (5) resilience: 2-3 sentences on why the top fixes matter for sustainability and climate adaptation
@@ -218,8 +220,9 @@ parallel to exterior-analyst, interior-inspector and stakes-analyst, each told t
 The score comes only from score_risk: report its number, band and factors exactly. Never compute or adjust a score.
 Report format: (1) exposure score 0-100 labelled ESTIMATE (higher = more exposed, lower is better; never call it a "readiness"
 score) with 3-5 reasons citing score_risk's evidence strings; (2) fix list
-from score_risk's ranked_fixes, points_removed written as "-N points" (a reduction, never "+N") and relative cost,
-no dollar figures unless the user gave a budget; (3) what is at stake, from the stakes-analyst (not recorded = say so;
+from score_risk's ranked_fixes, points_removed written as "-N points" (a reduction, never "+N"), relative cost and relative carbon tag (our
+heuristic, not sourced; call a high-carbon fix removing 3 or fewer points "low payoff for its carbon", mention any
+tradeoff text), no dollar figures unless the user gave a budget; (3) what is at stake, from the stakes-analyst (not recorded = say so;
 carbon at stake is upfront A1-A3 carbon a rebuild would re-emit, US commercial average, no probability of loss, never
 "avoided"); (4) interior, from the interior-inspector, as uncertain image readings; (5) resilience: 2-3 sentences on
 why the top fixes matter for sustainability and climate adaptation (protecting an existing building and its tenants avoids

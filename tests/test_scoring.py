@@ -72,3 +72,15 @@ assert "regional" not in {m["factor"] for m in vh["missing"]} and vh["score"] > 
 assert "regional" in {m["factor"] for m in sc.score(_z({"status": "error"}))["missing"]}, "failed lookup = missing, not zero"
 assert any("Very High" in e for x in vh["factors"] if x["key"] == "regional" for e in x["evidence"])
 print("regional tests passed")
+
+
+# ---- carbon-smart ranking ----
+rk = sc.rank_fixes(f)
+assert all(x["carbon"] in ("low", "med", "high") for x in rk)
+cs = sc.carbon_smart(rk)
+assert [x["id"] for x in cs] == [x["id"] for x in sorted(cs, key=lambda r: (-r["per_carbon"], -r["points_removed"]))]
+assert all(set(x["id"] for x in cs) == set(x["id"] for x in rk) for _ in [0]), "same fixes, only reordered"
+hi = sc.carbon_smart([{"id": "replace_roof", "label": "r", "cost": "high", "carbon": "high", "points_removed": 2},
+                      {"id": "screen_vents", "label": "v", "cost": "low", "carbon": "low", "points_removed": 2}])
+assert hi[0]["id"] == "screen_vents" and hi[1]["low_payoff"] and not hi[0]["low_payoff"]
+print("carbon-smart tests passed")
