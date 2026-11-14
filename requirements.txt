@@ -1,0 +1,7 @@
+streamlit
+deepagents
+langchain
+python-dotenv
+requests
+shapely
+pillow

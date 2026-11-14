@@ -1,0 +1,8 @@
+{"features": [{"properties": {
+  "metadata.collection": "MOCK-fixture", "structure.count": 1,
+  "parcel-tree-cover.percent": 34, "pool.detected": false,
+  "defensible-space.zone1-tree": 28,
+  "structures": [{"primary-structure": true, "footprint.area": 12000,
+    "roof-characteristics.material.class": "shingle", "roof-characteristics.shape.value": "gable",
+    "roof-characteristics.condition": 3}]},
+  "geometry": "POLYGON((-118.2500 34.0500,-118.2495 34.0500,-118.2495 34.0505,-118.2500 34.0505,-118.2500 34.0500))"}]}

@@ -1,0 +1,5 @@
+{"detections": [
+ {"label": "tree", "confidence": 0.91, "box_pct": [0.05, 0.10, 0.30, 0.45]},
+ {"label": "tree", "confidence": 0.84, "box_pct": [0.68, 0.55, 0.95, 0.90]},
+ {"label": "dry brush", "confidence": 0.72, "box_pct": [0.40, 0.70, 0.65, 0.95]},
+ {"label": "parking lot", "confidence": 0.88, "box_pct": [0.35, 0.10, 0.65, 0.40]}]}
