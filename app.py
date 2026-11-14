@@ -7,6 +7,7 @@ from tools import costar
 import scoring
 import sustainability
 import portfolio
+import equity
 import agent as ag
 
 st.set_page_config(page_title="Ember", layout="wide")
@@ -36,6 +37,17 @@ def nr(v):
 def plan_md(todos):
     return "\n".join(f"- {'✅' if t.get('status')=='completed' else '🔄' if t.get('status')=='in_progress' else '⬜'} {t.get('content')}"
                      for t in todos)
+
+
+def note_event(r, ev):
+    """Keep the agents' visible work for the Agent team tab: reasoning summaries, messages, tool calls and results."""
+    if ev["type"] in ("thinking", "say", "tool_call", "tool_result"):
+        if ev["type"] == "tool_call" and ev["name"] == "write_todos":
+            return
+        r["events"].append({"t": round(time.time() - r["t0"], 1), **ev})
+    elif ev["type"] == "usage":
+        lt = r["lane_tokens"].setdefault(ev["lane"], [0, 0])
+        lt[0] += ev["input"]; lt[1] += ev["output"]
 
 
 def line_for(ev):
@@ -84,21 +96,29 @@ if view_mode == "Portfolio":
     df = pd.DataFrame(rows).dropna(subset=["carbon_t"])
     df["people"] = df["employees_known"].fillna(0) + 5
     mx, my = float(df["screening_score"].median()), float(df["carbon_t"].median())
+    color_by = st.radio("Colour dots by", ["Neighborhood burden (CalEnviroScreen)", "CAL FIRE zone"], horizontal=True)
+    by_burden = color_by.startswith("Neighborhood")
     pick = alt.selection_point(name="pick", fields=["id"])
     base = alt.Chart(df)
     dots = base.mark_circle(opacity=0.75).encode(
         x=alt.X("screening_score:Q", title="Screening exposure (0-100, lower is better)"),
         y=alt.Y("carbon_t:Q", scale=alt.Scale(type="log"), title="Embodied carbon at stake (t CO2e, log scale)"),
         size=alt.Size("people:Q", legend=None, scale=alt.Scale(range=[40, 700])),
-        color=alt.Color("zone:N", title="CAL FIRE zone", scale=alt.Scale(domain=["Very High", "High", "Moderate", "none", "unknown"],
-                        range=["#d62728", "#ff7f0e", "#f2c200", "#8a8f98", "#cccccc"])),
-        tooltip=["name", "type", "screening_score", "band", "zone", "carbon_t", "employees_known", "tenants"],
+        color=(alt.Color("ces_pctile:Q", title="Neighborhood burden percentile", scale=alt.Scale(scheme="orangered", domain=[0, 100]))
+               if by_burden else
+               alt.Color("zone:N", title="CAL FIRE zone", scale=alt.Scale(domain=["Very High", "High", "Moderate", "none", "unknown"],
+                         range=["#d62728", "#ff7f0e", "#f2c200", "#8a8f98", "#cccccc"]))),
+        tooltip=["name", "type", "screening_score", "band", "zone", "ces_pctile", "carbon_t", "employees_known", "tenants"],
         opacity=alt.condition(pick, alt.value(0.9), alt.value(0.55))).add_params(pick)
     vline = base.mark_rule(strokeDash=[4, 4], color="#888").encode(x=alt.datum(mx))
     hline = base.mark_rule(strokeDash=[4, 4], color="#888").encode(y=alt.datum(my))
     ev = st.altair_chart(dots + vline + hline, on_select="rerun", selection_mode="pick", height=460)
     st.caption("Dot size = known employees (CoStar; unknown shown smallest). Top-right = above both medians: high exposure and "
                "high carbon at stake. Click a dot to select it.")
+    hi = df[df["ces_pctile"] >= 75]
+    both = hi[(hi["screening_score"] > mx) & (hi["carbon_t"] > my)]
+    st.markdown(f"**Equity lens:** {len(hi)} of {len(df)} buildings sit in the most-burdened quarter of California census tracts "
+                f"(CalEnviroScreen percentile 75 or higher); {len(both)} of them are also above both medians.")
     chosen_ids = [p["id"] for p in (ev.selection.get("pick") or [])] if ev and getattr(ev, "selection", None) else []
     if chosen_ids:
         r = df[df["id"] == chosen_ids[0]].iloc[0]
@@ -109,8 +129,9 @@ if view_mode == "Portfolio":
             st.rerun()
     top = df[(df["screening_score"] > mx) & (df["carbon_t"] > my)].sort_values("screening_score", ascending=False)
     st.markdown(f"#### Above both medians ({len(top)} of {len(df)})")
-    st.dataframe(top[["name", "type", "screening_score", "zone", "carbon_t", "employees_known", "tenants"]]
-                 .rename(columns={"screening_score": "screening exposure", "carbon_t": "carbon at stake (t)"}),
+    st.dataframe(top[["name", "type", "screening_score", "zone", "ces_pctile", "carbon_t", "employees_known", "tenants"]]
+                 .rename(columns={"screening_score": "screening exposure", "carbon_t": "carbon at stake (t)",
+                                  "ces_pctile": "neighborhood burden pctile"}),
                  hide_index=True, width="stretch")
     st.stop()
 
@@ -141,19 +162,23 @@ if run and run["bid"] != sel["id"]:
 
 def start_run():
     r = {"bid": sel["id"], "hazard": hazard, "tid": uuid.uuid4().hex, "lanes": {}, "plan": [], "report": "",
-         "chat": [], "tokens": [0, 0], "pending": None, "apply": [], "handoffs": [], "deep": deep, "seconds": None}
+         "chat": [], "tokens": [0, 0], "pending": None, "apply": [], "handoffs": [], "deep": deep, "seconds": None, "events": [], "lane_tokens": {}}
     t0 = time.time()
+    r["t0"] = t0
     r["agent"] = ag.build_agent(hazard, memory=True, mode="deep" if deep else "fast")
     with st.status("Agent team working...", expanded=True) as status:
         plan_box, log_box, text_box = st.empty(), st.container(), st.empty()
         acc = ""
         for ev in ag.stream_events(r["agent"], sel["id"], hazard, thread_id=r["tid"]):
+            note_event(r, ev)
             if ev["type"] == "plan":
                 r["plan"] = ev["todos"]
                 plan_box.markdown("**Plan**\n" + plan_md(ev["todos"]))
             elif ev["type"] == "tool_call" and ev["name"] != "write_todos":
                 r["lanes"].setdefault(ev["lane"], []).append(line_for(ev))
                 log_box.markdown(line_for(ev))
+            elif ev["type"] == "thinking":
+                log_box.markdown(f"💭 **{ev['lane']}** · reasoning summary: _{ev['text'][:220].strip()}..._")
             elif ev["type"] == "handoff":
                 r["handoffs"].append(ev)
                 log_box.markdown(f"{LANE_ICON.get(ev['from'], '🤖')} → {LANE_ICON.get(ev['to'], '🤖')} "
@@ -210,7 +235,11 @@ with rail:
             zone_txt = f"CAL FIRE zone: **{z['class']}**" if z.get("in_zone") else "outside CAL FIRE mapped zones (older maps)"
         else:
             zone_txt = "CAL FIRE zone: unavailable"
-        st.markdown(f"Band: **{after['band']}**" + (f" (now {base['score']}, {base['band']})" if chosen else "") + f"  \n{zone_txt}")
+        q = ag.get_equity(bid)
+        hood_txt = (f"Neighborhood burden: **{equity.ordinal(q['burden_percentile'])} percentile** (CalEnviroScreen 4.0)"
+                    if q.get("status") == "ok" else "Neighborhood burden: unavailable")
+        st.markdown(f"Band: **{after['band']}**" + (f" (now {base['score']}, {base['band']})" if chosen else "")
+                    + f"  \n{zone_txt}  \n{hood_txt}")
         with st.expander("Factor breakdown"):
             for f in after["factors"]:
                 st.caption(f"{f['label']}: {f['points']} pts")
@@ -280,6 +309,21 @@ with main:
             st.caption(cs["caveats"] + f" Source: {cs['basis']}: [CLF]({cs['source_url']}).")
         else:
             st.info("Gross building area not recorded in CoStar; carbon at stake not computed.")
+        st.markdown("#### Equity lens: who lives with the burden around this building")
+        eq = equity.lookup(sel["lat"], sel["lon"])
+        if eq.get("status") == "ok":
+            import pandas as pd
+            bars = pd.DataFrame({"measure": ["Overall burden", "Pollution burden", "Population vulnerability"],
+                                 "percentile": [eq["burden_percentile"], eq["pollution_percentile"], eq["vulnerability_percentile"]]})
+            chart = alt.Chart(bars).mark_bar().encode(
+                y=alt.Y("measure:N", sort=None, title=None),
+                x=alt.X("percentile:Q", scale=alt.Scale(domain=[0, 100]), title="Percentile among California census tracts (higher = more burdened)"),
+                color=alt.Color("percentile:Q", scale=alt.Scale(scheme="orangered", domain=[0, 100]), legend=None),
+                tooltip=["measure", "percentile"]).properties(height=130)
+            st.altair_chart(chart, width="stretch")
+            st.caption(f"Census tract {eq['tract']} · {eq['source']}. {equity.CAVEAT}")
+        else:
+            st.info(f"Neighborhood burden unavailable for this building ({eq.get('status')}). Not treated as zero.")
         if stk["tenants"]:
             st.dataframe([{"Tenant": t["name"], "Employees": nr(t["employees"]), "Sq ft": nr(t["sqft"]),
                            "Lease expires": nr(t["lease_expires"])} for t in stk["tenants"]],
@@ -349,6 +393,28 @@ with main:
                         if len(txt) > 260:
                             with st.expander("Full message"):
                                 st.markdown(txt)
+            evs = run.get("events", [])
+            if evs:
+                with st.expander(f"Agent activity ({len(evs)} steps)", expanded=bool(run.get("deep"))):
+                    st.caption("What each agent did, in order. 'Reasoning summary' is the summary the model API returns of its own "
+                               "reasoning (Deep mode only; not a complete trace). Messages and tool results are the real text.")
+                    for e in evs:
+                        who = f"{LANE_ICON.get(e['lane'], '🤖')} **{e['lane']}** · {e['t']}s"
+                        if e["type"] == "thinking":
+                            st.markdown(f"💭 {who} · reasoning summary")
+                            st.markdown("> " + e["text"].strip().replace("\n", "\n> ")[:900])
+                        elif e["type"] == "say":
+                            st.markdown(f"💬 {who} · message")
+                            st.markdown(e["text"][:500] + ("..." if len(e["text"]) > 500 else ""))
+                        elif e["type"] == "tool_call":
+                            st.markdown(f"🔧 {who} · calls `{e['name']}` {json.dumps(e['args'])[:140]}")
+                        elif e["type"] == "tool_result":
+                            st.markdown(f"📥 {who} · `{e['name']}` returned {len(e['content']):,} chars")
+                            with st.expander("Show result"):
+                                st.code(e["content"][:1500])
+            if run.get("lane_tokens"):
+                st.dataframe([{"Agent": k, "Tokens in": v[0], "Tokens out": v[1]} for k, v in run["lane_tokens"].items()],
+                             hide_index=True, width="stretch")
             with st.expander("Plan and tool calls by agent"):
                 st.markdown(plan_md(run["plan"]))
                 for lane, lines in run["lanes"].items():
@@ -376,6 +442,7 @@ with main:
                     with st.spinner("Thinking..."):
                         try:
                             for ev in events:
+                                note_event(run, ev)
                                 if ev["type"] == "text":
                                     ans = ev["text"]
                                 elif ev["type"] == "handoff":

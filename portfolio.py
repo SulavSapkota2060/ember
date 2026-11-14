@@ -24,8 +24,9 @@ def screening_facts(row: dict, prop: dict, zone: dict | None) -> dict:
     }
 
 
-def build(screen: dict, zones: dict) -> list[dict]:
-    """screen: out/screen_la.json (id -> row); zones: id -> zone dict (hazard_zone format). Skips rows without data."""
+def build(screen: dict, zones: dict, equity: dict | None = None) -> list[dict]:
+    """screen: out/screen_la.json (id -> row); zones: id -> zone dict (hazard_zone format); equity: id -> equity.lookup dict.
+    Skips rows without data."""
     rows = []
     for key, row in screen.items():
         if row.get("status") != 200 or row.get("z1t") is None:
@@ -35,12 +36,18 @@ def build(screen: dict, zones: dict) -> list[dict]:
         stk = costar.get_stakes(pid)
         cs = sustainability.carbon_at_stake(prop.get("gba_sqft"))
         z = zones.get(str(pid))
+        q = (equity or {}).get(str(pid)) or {}
         sc = scoring.score(screening_facts(row, prop, z if (z or {}).get("status") == "ok" else None))
         rows.append({"id": pid, "name": row.get("name") or prop.get("address"), "type": row.get("type"),
                      "lat": row["lat"], "lon": row["lon"], "screening_score": sc["score"], "band": sc["band"],
                      "zone": (z or {}).get("class") if (z or {}).get("in_zone") else ("none" if (z or {}).get("status") == "ok" else "unknown"),
                      "carbon_t": cs["tonnes_co2e"] if cs else None, "employees_known": stk["employees_known"],
-                     "tenants": stk["tenant_count"], "sprinklers": prop.get("sprinklers")})
+                     "tenants": stk["tenant_count"], "sprinklers": prop.get("sprinklers"),
+                     "ces_pctile": q.get("burden_percentile") if q.get("status") == "ok" else None,
+                     "ces_decile": q.get("burden_decile") if q.get("status") == "ok" else None,
+                     "ces_pollution": q.get("pollution_percentile") if q.get("status") == "ok" else None,
+                     "ces_vulnerability": q.get("vulnerability_percentile") if q.get("status") == "ok" else None,
+                     "ces_status": q.get("status", "not_run")})
     return rows
 
 

@@ -1,7 +1,7 @@
 import json, threading
 from config import LLM_MODEL
 from hazards import HAZARDS
-import scoring, sustainability, review, llm
+import scoring, sustainability, review, llm, equity
 from config import VISION_MODEL as VISION, VISION_FIRST_MODEL as VISION_FIRST
 from tools import costar, vexcel, hazard_zone, actions, matterport, interior
 
@@ -123,6 +123,7 @@ def get_stakes(building_id: int) -> str:
     that are None are not recorded by CoStar; never estimate them."""
     out = costar.get_stakes(building_id)
     out["embodied_carbon_at_stake"] = sustainability.carbon_at_stake(costar.get_property(building_id).get("gba_sqft"))
+    out["neighborhood_burden"] = _equity(_ctx(building_id))  # CalEnviroScreen tract percentile: context, not a fire metric
     return json.dumps(out)
 
 def _zone(c):
@@ -131,6 +132,16 @@ def _zone(c):
         if "zone" not in c:
             c["zone"] = hazard_zone.get_hazard_zone(c["prop"]["lat"], c["prop"]["lon"], _HAZARD)
     return c["zone"]
+
+def _equity(c):
+    """Neighborhood burden (CalEnviroScreen tract), cached per building. Context only; never part of the score."""
+    with _key_lock(c["prop"]["id"], "equity"):
+        if "equity" not in c:
+            c["equity"] = equity.lookup(c["prop"]["lat"], c["prop"]["lon"])
+    return c["equity"]
+
+def get_equity(building_id) -> dict:
+    return _equity(_ctx(building_id))
 
 def get_facts(building_id) -> dict:
     """Scoring facts for a building (used by the UI for instant what-if). Builds them if score_risk has not run."""
@@ -165,7 +176,8 @@ def _gather(building_id):
     bid = int(building_id)
     t0 = time.time()
     futs = [_pool.submit(_safe, detect_hazard_features, bid), _pool.submit(_safe, get_interior, bid),
-            _pool.submit(_safe, get_stakes, bid), _pool.submit(_safe, lambda b: json.dumps(_zone(_ctx(b))), bid)]
+            _pool.submit(_safe, get_stakes, bid), _pool.submit(_safe, lambda b: json.dumps(_zone(_ctx(b))), bid),
+            _pool.submit(_safe, lambda b: json.dumps(_equity(_ctx(b))), bid)]
     for f in futs:
         f.result()
     _ctx(bid)["gather_seconds"] = round(time.time() - t0, 1)
@@ -204,6 +216,11 @@ def _worker_reports(bid, f, sc, stk, cs, inner):
               f"{nr(stk['occupied_sqft'])} sq ft occupied; last sale "
               f"{('$' + format(sale['price'], ',.0f') + ' ' + sale['date'] + ' (' + sale['price_status'] + (', PORTFOLIO sale' if sale.get('portfolio_sale') else '') + ')') if sale and sale.get('price') else 'not recorded'}; "
               f"carbon at stake {cs['tonnes_co2e']:,} t CO2e." if cs else "carbon at stake not computed (area not recorded).")
+    q = _equity(c)
+    if q.get("status") == "ok":
+        stakes += (f" Neighborhood burden {equity.ordinal(q['burden_percentile'])} percentile "
+                   f"(pollution {equity.ordinal(q['pollution_percentile'])}, vulnerability {equity.ordinal(q['vulnerability_percentile'])}; "
+                   f"CalEnviroScreen 4.0, context only).")
     return {"exterior-analyst": ext, "interior-inspector": ints, "stakes-analyst": stakes}
 
 def nr(v):
@@ -237,6 +254,10 @@ def _brief(building_id) -> dict:
         "stakes": {"tenants": stk["tenant_count"], "largest_tenants": [t["name"] for t in stk["tenants"][:3]],
                    "employees_known": stk["employees_known"], "employees_coverage": stk["employees_known_for"],
                    "occupied_sqft": stk["occupied_sqft"], "last_sale": stk["last_sale"]},
+        "neighborhood_burden": ({"percentile": _equity(c).get("burden_percentile"), "pollution_percentile": _equity(c).get("pollution_percentile"),
+                                 "vulnerability_percentile": _equity(c).get("vulnerability_percentile"), "source": "CalEnviroScreen 4.0, census tract",
+                                 "caveat": "context only; not a fire metric; not part of the score"}
+                                if _equity(c).get("status") == "ok" else "unavailable"),
         "carbon_at_stake_tonnes_co2e": cs["tonnes_co2e"] if cs else None,
         "carbon_note": "upfront A1-A3 a rebuild would re-emit; US commercial average; not a forecast; never 'avoided'",
         "interior": ({k: o["status"] for k, o in inner["observations"].items()} if inner.get("status") == "ok" else inner.get("status")),
@@ -274,7 +295,7 @@ def _evidence(building_id) -> dict:
             return {k: slim(v) for k, v in o.items() if "wkt" not in k and "geometry" not in k}
         return [slim(v) for v in o] if isinstance(o, list) else o
     return {"building_id": int(building_id), "property": c["prop"], "parcel_attributes": slim(c["el"]["attrs"]), "score": sc,
-            "ranked_fixes": scoring.rank_fixes(f), "stakes": stk, "hazard_zone": _zone(c),
+            "ranked_fixes": scoring.rank_fixes(f), "stakes": stk, "hazard_zone": _zone(c), "neighborhood_burden": _equity(c),
             "interior": _interior_view(c), "detections": det,
             "scoring_conventions": "score 0-100, HIGHER = MORE EXPOSED; points_removed are reductions written as -N"}
 
@@ -337,7 +358,7 @@ _SUB_RULES = ("Report facts only, quoting numbers exactly as the tools returned 
               "never invent data, say 'not recorded' for missing values. You cannot open image files. Be concise: "
               "reply with a short factual summary, not raw JSON.")
 
-def _subagents():
+def _subagents(think=False):
     from config import LIGHT_MODEL
     return [
         {"name": "exterior-analyst",
@@ -362,9 +383,10 @@ def _subagents():
                         "with price status, and embodied carbon at stake. Give it the building_id.",
          "system_prompt": "You are the stakes analyst. Call get_stakes once for the building_id you are given and summarise "
                           "tenant count, largest tenants, known employees (and how many tenants that covers), occupied sq ft, "
-                          "last sale with its price status, and embodied_carbon_at_stake with its caveats (US commercial "
-                          "average, A1-A3 only, not a forecast). " + _SUB_RULES,
-         "tools": [get_stakes], "model": llm.chat(LIGHT_MODEL)},
+                          "last sale with its price status, embodied_carbon_at_stake with its caveats (US commercial "
+                          "average, A1-A3 only, not a forecast), and neighborhood_burden (CalEnviroScreen percentile: context "
+                          "only, not a fire metric, not part of the score). " + _SUB_RULES,
+         "tools": [get_stakes], "model": llm.chat(LIGHT_MODEL, think=think)},
         {"name": "reviewer",
          "description": "Independent auditor of a DRAFT report. Send it the building_id and the full draft text; it checks "
                         "every claim against the ground-truth evidence and returns a JSON verdict with issues. It never "
@@ -422,7 +444,8 @@ One short verdict sentence.
 **Fix first:** 3 bullets: fix · -N points · cost · carbon tag (our heuristic); say "low payoff for its carbon" when flagged and
 name a tradeoff if present.
 **At stake:** one line: tenants, known employees (with coverage), carbon at stake in tonnes CO2e (upfront A1-A3 a rebuild
-would re-emit, US commercial average, not a forecast, never "avoided"); say "not recorded" for missing values.
+would re-emit, US commercial average, not a forecast, never "avoided"), and the neighborhood burden percentile
+(CalEnviroScreen; context only, not a fire metric, not part of the score); say "not recorded" for missing values.
 **Gaps:** one line: missing factors and uncertain interior readings (not_seen is not proof of absence).
 Rules: the score is a heuristic estimate; never call it a "readiness" score; no zone distances; do not interpret roof
 condition; never invent data. Follow-ups: what_if for "what if I do X", plan_budget for budgets (ask for per-fix dollar
@@ -443,11 +466,12 @@ def build_agent(hazard: str, memory: bool = False, mode: str = "fast"):
         from langgraph.checkpoint.memory import InMemorySaver
         kw["checkpointer"] = InMemorySaver()
         kw["interrupt_on"] = {"draft_action": True}  # human approves/edits/rejects drafts before they are saved
-    model = llm.chat(LLM_MODEL)
     hp = HAZARDS[hazard]["prompt"]
-    if mode == "deep":
-        return create_deep_agent(model=model, tools=TEAM_TOOLS, subagents=_subagents(), middleware=[TodoListMiddleware()],
+    if mode == "deep":  # Deep mode shows the agents' work, including the API's summarized reasoning
+        return create_deep_agent(model=llm.chat(LLM_MODEL, think=True), tools=TEAM_TOOLS, subagents=_subagents(think=True),
+                                 middleware=[TodoListMiddleware()],
                                  system_prompt=SYSTEM_TEAM.format(hazard_prompt=hp), **kw)
+    model = llm.chat(LLM_MODEL)
     if mode == "solo":
         return create_deep_agent(model=model, tools=TOOLS, middleware=[TodoListMiddleware()],
                                  system_prompt=SYSTEM_SOLO.format(hazard_prompt=hp), **kw)
@@ -491,6 +515,19 @@ def _events(agent, inp, cfg):
                 kind = getattr(m, "type", "")
                 if kind == "ai":
                     u = getattr(m, "usage_metadata", None)
+                    for tc in getattr(m, "tool_calls", []) or []:  # learn which subagent this is before labelling anything
+                        if ns and tuple(ns) not in lane_of and tc["name"] in _LANE_BY_TOOL:
+                            lane_of[tuple(ns)] = _LANE_BY_TOOL[tc["name"]]
+                    if ns:
+                        lane = lane_of.get(tuple(ns), "subagent")
+                    blocks = m.content if isinstance(m.content, list) else []
+                    for b in blocks:  # reasoning SUMMARY returned by the API (Deep mode only; empty otherwise)
+                        if isinstance(b, dict) and b.get("type") == "thinking" and (b.get("thinking") or "").strip():
+                            yield {"type": "thinking", "lane": lane, "text": b["thinking"]}
+                    say = m.content if isinstance(m.content, str) else "".join(
+                        b.get("text", "") for b in blocks if isinstance(b, dict) and b.get("type") == "text")
+                    if say.strip() and (getattr(m, "tool_calls", None) or ns):  # intermediate message from an agent
+                        yield {"type": "say", "lane": lane, "text": say}
                     for tc in getattr(m, "tool_calls", []) or []:
                         if tc["name"] == "task" and not ns:
                             who = (tc["args"] or {}).get("subagent_type", "subagent")

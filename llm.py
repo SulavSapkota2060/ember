@@ -7,8 +7,8 @@ from langchain.chat_models import init_chat_model
 def chat(model: str, think: bool = False):
     """Haiku: thinking disabled. Sonnet 5.5 cannot disable thinking (the API rejects it) but its adaptive thinking
     stayed at 0 reasoning tokens on a simple call, so we only lower its effort. Output length is its real latency lever."""
-    if think:
-        return init_chat_model(model)
+    if think:  # Deep mode: ask the API to return a SUMMARY of the model's reasoning (the default returns empty thinking text)
+        return init_chat_model(model, thinking={"type": "adaptive", "display": "summarized"})
     if "haiku" in model:
         return init_chat_model(model, thinking={"type": "disabled"})
     return init_chat_model(model, reasoning_effort="low")
