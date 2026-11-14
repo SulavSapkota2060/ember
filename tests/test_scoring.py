@@ -23,7 +23,7 @@ assert s == sorted(s) and s[0] < s[-1], s
 # 3. missing data renormalizes, never crashes, is reported
 f = base(sprinklers=None, construction=None, z1t=None)
 r = sc.score(f)
-assert {m["factor"] for m in r["missing"]} >= {"vegetation", "protection", "occupancy", "interior", "regional"}
+assert {m["factor"] for m in r["missing"]} >= {"vegetation", "protection", "occupancy", "interior", "regional"}  # interior None here
 assert 0 <= r["score"] <= 100
 assert abs(sum(x["weight"] for x in r["factors"]) - 100) < 0.5
 assert sc.score({"has_structure_data": False})["score"] == 0  # no data -> empty, not an exception
@@ -42,3 +42,22 @@ p = sc.plan_within_budget(f, 1000, {"screen_vents": 400, "clear_roof_debris": 30
 assert p["cost"] <= 1000 and "replace_roof" not in p["fixes"] and p["after"] <= p["before"]
 assert sc.plan_within_budget(f, 0, {"screen_vents": 400})["fixes"] == []
 print("all scoring tests passed")
+
+
+# ---- interior factor ----
+def _with_interior(obs, n=3):
+    g = dict(f); g["interior"] = {"n_images": n, "obs": dict(obs)}; return g
+none_seen = {"fire_extinguisher": "not_seen", "sprinkler_head": "not_seen", "alarm_or_smoke_detector": "cannot_tell",
+             "exit_sign": "not_seen", "blocked_egress": "not_seen", "stored_combustibles": "not_seen"}
+base_i = sc.score(_with_interior(none_seen))
+assert "interior" not in {m["factor"] for m in base_i["missing"]}
+prot = sc.score(_with_interior({**none_seen, "fire_extinguisher": "seen", "sprinkler_head": "seen"}))
+haz = sc.score(_with_interior({**none_seen, "blocked_egress": "seen"}))
+assert prot["score"] < base_i["score"] < haz["score"], (prot["score"], base_i["score"], haz["score"])
+assert sc.score(_with_interior(none_seen, n=0))["missing"], "0 images must count as missing"
+gi = _with_interior({**none_seen, "blocked_egress": "seen", "stored_combustibles": "seen"})
+assert sc.whatif(gi, ["clear_egress", "clear_stored_combustibles", "add_extinguishers"])["delta"] > 0
+assert gi["interior"]["obs"]["blocked_egress"] == "seen"  # fixes never mutate the input
+ids = {x["id"] for x in sc.rank_fixes(_with_interior(none_seen))}
+assert "add_extinguishers" in ids and "clear_egress" not in ids  # only fixes that change something
+print("interior tests passed")

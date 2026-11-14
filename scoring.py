@@ -19,7 +19,7 @@ WEIGHTS = {
     "surroundings": 10,   # neighboring buildings + combustible attachments (Vexcel)
     "protection": 15,     # sprinklers + construction material (CoStar)
     "occupancy": 5,       # tenant industry hazard (CoStar) - not wired yet
-    "interior": 15,       # Matterport interior checks - stretch, not wired yet
+    "interior": 15,       # Matterport interior images read by a vision model (uncertain observations)
     "regional": 10,       # official hazard zone lookup - not wired yet
 }
 LABELS = {
@@ -153,6 +153,36 @@ def _protection(f):
     return sum(w * v for w, v in parts) / tw, ev, None
 
 
+# HEURISTIC interior model. facts["interior"] = {"n_images": N, "obs": {item: seen|not_seen|cannot_tell}}.
+# Start at 0.5 (unknown). Protective items SEEN lower risk; hazards SEEN raise it. An item not seen is NOT
+# treated as absent (images cover little of the building), so it adds no penalty.
+INTERIOR_BASE = 0.5
+# sprinkler_head is deliberately NOT scored here: the vision read confuses it with HVAC diffusers (seen on
+# 7083 Hollywood Blvd), and sprinklers are already scored from CoStar in the protection factor.
+INTERIOR_PROTECT = {"fire_extinguisher": ("fire extinguisher", 0.15),
+                    "alarm_or_smoke_detector": ("alarm/detector", 0.10), "exit_sign": ("exit sign", 0.05)}
+INTERIOR_HAZARD = {"blocked_egress": ("blocked exit path", 0.25), "stored_combustibles": ("stored combustibles", 0.15)}
+
+
+def _interior(f):
+    i = f.get("interior")
+    if not i or not i.get("n_images"):
+        return None, [], "no interior images analyzed"
+    obs, n = i.get("obs") or {}, i["n_images"]
+    v, ev = INTERIOR_BASE, []
+    for key, (label, d) in INTERIOR_PROTECT.items():
+        st = obs.get(key)
+        if st == "seen":
+            v -= d; ev.append(f"{label}: seen")
+        else:
+            ev.append(f"{label}: " + (f"not seen in {n} image(s), not proof of absence" if st == "not_seen" else "can't tell"))
+    for key, (label, d) in INTERIOR_HAZARD.items():
+        if obs.get(key) == "seen":
+            v += d; ev.append(f"{label}: seen")
+    ev.append(f"based on {n} Matterport image(s) read by a vision model (uncertain)")
+    return min(max(v, 0.0), 1.0), ev, None
+
+
 def _optional(fact_key, label_key):
     def fn(f):
         v = f.get(fact_key)
@@ -165,7 +195,7 @@ def _optional(fact_key, label_key):
 
 _FACTORS = {
     "vegetation": _vegetation, "roof": _roof, "surroundings": _surroundings, "protection": _protection,
-    "occupancy": _optional("occupancy", "occupancy"), "interior": _optional("interior", "interior"),
+    "occupancy": _optional("occupancy", "occupancy"), "interior": _interior,
     "regional": _optional("zone_hazard", "regional"),
 }
 
@@ -205,6 +235,13 @@ def _f_sprinklers(f):
     if f.get("sprinklers") is False:  # unknown (None) stays unknown: no fix is claimed
         f["sprinklers"] = True
 def _f_brush(f): f["dry_brush_n"] = 0
+def _set_obs(f, key, frm, to):
+    o = (f.get("interior") or {}).get("obs")
+    if o is not None and o.get(key) == frm:
+        o[key] = to
+def _f_egress(f): _set_obs(f, "blocked_egress", "seen", "not_seen")
+def _f_stored(f): _set_obs(f, "stored_combustibles", "seen", "not_seen")
+def _f_extinguishers(f): _set_obs(f, "fire_extinguisher", "not_seen", "seen")
 
 # cost is RELATIVE (low/med/high). No dollar figures: the user supplies those.
 FIXES = {
@@ -216,6 +253,9 @@ FIXES = {
     "replace_wood": ("Replace wood decks/fences near the building", "med", _f_wood),
     "add_sprinklers": ("Add or restore sprinkler coverage", "high", _f_sprinklers),
     "clear_dry_brush": ("Remove detected dry brush", "low", _f_brush),
+    "clear_egress": ("Clear blocked exit paths (seen in Matterport images)", "low", _f_egress),
+    "clear_stored_combustibles": ("Remove stored combustibles (seen in Matterport images)", "low", _f_stored),
+    "add_extinguishers": ("Place/verify fire extinguishers (none seen in Matterport images)", "low", _f_extinguishers),
 }
 _COST_RANK = {"low": 1, "med": 2, "high": 3}
 

@@ -71,6 +71,11 @@ if go:
                     if ev["name"] != "write_todos":
                         run["log"].append(f"`{ev['name']}` {json.dumps(ev['args'])[:120]}")
                         log_box.markdown("🔧 " + run["log"][-1])
+                elif ev["type"] == "tool_result" and ev["name"] == "get_interior":
+                    try:
+                        run["interior"] = json.loads(ev["content"])
+                    except Exception:
+                        pass
                 elif ev["type"] == "tool_result" and ev["name"] == "detect_hazard_features":
                     try:
                         run["images"] = json.loads(ev["content"])
@@ -140,6 +145,21 @@ if sel and run and run["bid"] == sel["id"]:
     with rep:
         st.markdown(run["report"])
         st.caption(f"Saved to out/report_{bid}.md")
+
+    inner = run.get("interior")
+    if inner and inner.get("status") == "ok":
+        st.subheader("Inside (Matterport)")
+        st.caption("A vision model reads these images. Observations are uncertain; 'not_seen' is not proof an item is "
+                   "absent. The sprinkler reading is unreliable and is not scored (CoStar is used for sprinklers).")
+        cols = st.columns(3)
+        for k, im in enumerate(inner["images"]):
+            with cols[k % 3]:
+                st.image(im["path"], caption=im["caption"])
+                st.link_button("Open 3D walkthrough", im["view_url"])
+        st.dataframe([{"Item": name.replace("_", " "), "Status": o["status"], "Note": o["note"]}
+                      for name, o in inner["observations"].items()], hide_index=True, width="stretch")
+    elif inner:
+        st.info(f"Interior step: {inner.get('status')} {inner.get('reason', '')}")
 
     with st.expander("Agent plan and tool log"):
         st.markdown(plan_md(run["plan"]))

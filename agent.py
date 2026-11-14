@@ -2,7 +2,7 @@ import json, threading
 from config import LLM_MODEL
 from hazards import HAZARDS
 import scoring
-from tools import costar, vexcel, hazard_zone, actions
+from tools import costar, vexcel, hazard_zone, actions, matterport, interior
 
 _cache = {}
 _lock = threading.Lock()
@@ -43,13 +43,44 @@ def detect_hazard_features(building_id: int) -> str:
     slim = [{k: v for k, v in d.items() if k in ("n", "label", "confidence")} for d in dets]
     return json.dumps({"detections": slim, **ann})
 
+def get_interior(building_id: int) -> str:
+    """Fetch Matterport interior images for the building and have a vision model list visible fire-protection
+    items (extinguishers, sprinkler heads, alarms, exit signs) and hazards (blocked exits, stored combustibles).
+    Returns per-item status seen/not_seen/cannot_tell with notes and the image paths. The sprinkler_head reading is
+    unreliable (it can mistake HVAC diffusers) and is NOT scored: say so and rely on CoStar for sprinklers. These are uncertain
+    observations from images: 'not_seen' is NOT proof of absence. Call BEFORE score_risk so it counts."""
+    c = _ctx(building_id)
+    models = c["prop"].get("matterport_models") or []
+    if not models:
+        return json.dumps({"status": "no_matterport_model"})
+    if not matterport.available():
+        return json.dumps({"status": "unavailable", "reason": "Matterport credentials not set"})
+    with _lock:
+        if "interior_raw" not in c:
+            try:
+                imgs = matterport.fetch_images(models)
+                c["interior_raw"] = {"status": "ok", "images": imgs, "result": interior.analyze(imgs)} if imgs else \
+                    {"status": "no_images"}
+            except Exception as e:  # report, never invent
+                c["interior_raw"] = {"status": "error", "reason": f"{type(e).__name__}: {str(e)[:200]}"}
+    raw = c["interior_raw"]
+    if raw["status"] != "ok":
+        return json.dumps(raw)
+    c["interior"] = {"n_images": raw["result"]["n_images"], "obs": raw["result"]["obs"]}
+    r = raw["result"]
+    return json.dumps({"status": "ok", "n_images": r["n_images"],
+                       "images": [{"path": i["path"], "caption": i["caption"], "view_url": i["view_url"]}
+                                  for i in raw["images"]],
+                       "observations": {k: {"status": r["obs"][k], "note": r["notes"][k], "images": r["images_for"][k]}
+                                        for k in r["obs"]}})
+
 def score_risk(building_id: int) -> str:
     """Compute the fire-readiness score with the project's rule-based heuristic (code, not your judgement).
     Returns score 0-100, band, per-factor points with evidence, factors missing data, and ranked fixes
     (each with points_removed from the score and relative cost). Call this AFTER detect_hazard_features so detections count.
     Report this score exactly; never compute or adjust a score yourself."""
     c = _ctx(building_id)
-    f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"))
+    f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), interior=c.get("interior"))
     c["facts"] = f
     r = scoring.score(f)
     r["ranked_fixes"] = scoring.rank_fixes(f)
@@ -65,7 +96,7 @@ def get_facts(building_id) -> dict:
     """Scoring facts for a building (used by the UI for instant what-if). Builds them if score_risk has not run."""
     c = _ctx(building_id)
     if "facts" not in c:
-        c["facts"] = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"))
+        c["facts"] = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"), interior=c.get("interior"))
     return c["facts"]
 
 def what_if(building_id: int, fix_ids: list[str]) -> str:
@@ -92,20 +123,21 @@ def draft_action(building_id: int, subject: str, body: str) -> str:
     return actions.write_action_draft(building_id, subject, body)
 
 TOOLS = [get_property, get_parcel_attributes, get_aerial, detect_hazard_features, get_hazard_zone,
-         get_stakes, score_risk, what_if, plan_budget, draft_action]
+         get_stakes, get_interior, score_risk, what_if, plan_budget, draft_action]
 
 SYSTEM = """You are Ember, a hazard-readiness analyst for commercial buildings.
 {hazard_prompt}
 Process: write a plan with the todo tool first and update item statuses as you go. Gather data with the
-data tools (these can run together), then call detect_hazard_features, THEN score_risk (it needs the
-detections), then report.
+data tools (these can run together), then call detect_hazard_features and get_interior (both feed the score),
+THEN score_risk, then report.
 The score comes only from score_risk: report its number, band and factors exactly. Never compute, adjust or
 estimate a score yourself.
 Report format: (1) score 0-100 labelled ESTIMATE with 3-5 reasons that cite the evidence strings returned
 by score_risk (and callout numbers when relevant); (2) fix list taken from score_risk's ranked_fixes, with
 its points_removed written as "-N points" (a reduction, never "+N") and relative cost (low/med/high), no dollar figures unless the user gave a budget;
 (3) what is at stake, from get_stakes (tenants, known employees, last sale with its price status; say
-"not recorded" for None values, never estimate); (4) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
+"not recorded" for None values, never estimate); (4) interior: what get_interior saw, as uncertain image readings (say not_seen is not proof of absence; if its
+status is not ok, say why); (5) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
 Follow-up questions: use what_if for "what if I do X" and plan_budget for budget questions (ask the user for
 per-fix dollar costs if they gave none; never invent prices). Quote results exactly; deltas are reductions
 ("-N points"). Keep answers short.
@@ -150,4 +182,4 @@ def stream_events(agent, building_id: int, hazard: str, user_msg: str | None = N
                     if txt.strip() and not getattr(m, "tool_calls", None):
                         yield {"type": "text", "text": txt}
                 elif kind == "tool":
-                    yield {"type": "tool_result", "name": m.name, "content": str(m.content)[:20000 if m.name == "detect_hazard_features" else 2000]}
+                    yield {"type": "tool_result", "name": m.name, "content": str(m.content)[:20000 if m.name in ("detect_hazard_features", "get_interior") else 2000]}
