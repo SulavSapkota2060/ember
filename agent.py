@@ -46,7 +46,7 @@ def detect_hazard_features(building_id: int) -> str:
 def score_risk(building_id: int) -> str:
     """Compute the fire-readiness score with the project's rule-based heuristic (code, not your judgement).
     Returns score 0-100, band, per-factor points with evidence, factors missing data, and ranked fixes
-    (each with score delta and relative cost). Call this AFTER detect_hazard_features so detections count.
+    (each with points_removed from the score and relative cost). Call this AFTER detect_hazard_features so detections count.
     Report this score exactly; never compute or adjust a score yourself."""
     c = _ctx(building_id)
     f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"))
@@ -55,6 +55,11 @@ def score_risk(building_id: int) -> str:
     r["ranked_fixes"] = scoring.rank_fixes(f)
     r["detections_used"] = c.get("dets") is not None
     return json.dumps(r)
+
+def get_stakes(building_id: int) -> str:
+    """CoStar stakes: current tenants, known employees, occupied sq ft, last sale with price status. Values
+    that are None are not recorded by CoStar; never estimate them."""
+    return json.dumps(costar.get_stakes(building_id))
 
 def get_hazard_zone(building_id: int) -> str:
     """Official hazard-zone lookup. May return status 'unavailable': then say so and score from imagery."""
@@ -66,7 +71,7 @@ def draft_action(building_id: int, subject: str, body: str) -> str:
     return actions.write_action_draft(building_id, subject, body)
 
 TOOLS = [get_property, get_parcel_attributes, get_aerial, detect_hazard_features, get_hazard_zone,
-         score_risk, draft_action]
+         get_stakes, score_risk, draft_action]
 
 SYSTEM = """You are Ember, a hazard-readiness analyst for commercial buildings.
 {hazard_prompt}
@@ -77,8 +82,9 @@ The score comes only from score_risk: report its number, band and factors exactl
 estimate a score yourself.
 Report format: (1) score 0-100 labelled ESTIMATE with 3-5 reasons that cite the evidence strings returned
 by score_risk (and callout numbers when relevant); (2) fix list taken from score_risk's ranked_fixes, with
-its score deltas and relative cost (low/med/high), no dollar figures unless the user gave a budget;
-(3) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
+its points_removed written as "-N points" (a reduction, never "+N") and relative cost (low/med/high), no dollar figures unless the user gave a budget;
+(3) what is at stake, from get_stakes (tenants, known employees, last sale with its price status; say
+"not recorded" for None values, never estimate); (4) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
 Rules: the score is a transparent heuristic, not a validated model. Never invent data a tool did not
 return. Do not state distances or units for defensible-space zones (the data does not define them): say
 "zone 1 (nearest the building)" and quote the percentages as given. The roof condition value has an

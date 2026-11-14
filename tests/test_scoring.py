@@ -37,7 +37,7 @@ assert f == snap
 assert sc.whatif(f, list(sc.FIXES))["after"] < sc.score(f)["score"]
 
 # 5. rank + budget
-rk = sc.rank_fixes(f); assert rk and all(x["delta"] > 0 for x in rk)
+rk = sc.rank_fixes(f); assert rk and all(x["points_removed"] > 0 for x in rk)
 p = sc.plan_within_budget(f, 1000, {"screen_vents": 400, "clear_roof_debris": 300, "replace_roof": 50000})
 assert p["cost"] <= 1000 and "replace_roof" not in p["fixes"] and p["after"] <= p["before"]
 assert sc.plan_within_budget(f, 0, {"screen_vents": 400})["fixes"] == []

@@ -242,8 +242,8 @@ def rank_fixes(facts: dict) -> list[dict]:
     for fid, (label, cost, _fn) in FIXES.items():
         d = base - score(apply_fixes(facts, [fid]))["score"]
         if d > 0:
-            rows.append({"id": fid, "label": label, "cost": cost, "delta": d})
-    rows.sort(key=lambda r: -(r["delta"] / _COST_RANK[r["cost"]]))
+            rows.append({"id": fid, "label": label, "cost": cost, "points_removed": d})
+    rows.sort(key=lambda r: -(r["points_removed"] / _COST_RANK[r["cost"]]))
     return rows
 
 
