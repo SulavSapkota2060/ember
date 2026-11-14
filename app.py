@@ -4,12 +4,23 @@ from config import MOCK, LLM_MODEL, OUT_DIR
 from hazards import HAZARDS
 from tools import costar
 import scoring
+import sustainability
 import agent as ag
 
 st.set_page_config(page_title="Ember", layout="wide")
-st.title("Ember: building hazard readiness")
-st.caption("Risk scores are heuristic ESTIMATES, not a validated model.")
 S = st.session_state
+LANE_ICON = {"orchestrator": "🧭", "exterior-analyst": "🛰️", "interior-inspector": "🏢", "stakes-analyst": "💼",
+             "subagent": "🤖"}
+QUICK = {  # one-click agent jobs (no typing); each is sent to the same agent thread as a follow-up
+    "Plan my retrofit budget": "I have $5,000. Use these costs: screen vents $800, clear zone 1 $2,500, thin zone 2 $1,500, "
+                               "clear roof debris $400, clear dry brush $600. What should I do first? Use plan_budget.",
+    "Brief for the insurer": "Rewrite the findings as a one-page briefing for the building's property insurer. Use only "
+                             "data already gathered; keep the estimate and data-gap caveats.",
+    "Brief for tenants": "Rewrite the findings as a short, calm notice to tenants: what we found, what is being done, "
+                         "what is not known. Use only data already gathered.",
+    "Draft contractor email": "Draft a contractor request email for the cheapest fix with a real score effect, using the "
+                              "draft_action tool.",
+}
 
 
 def nr(v):
@@ -21,7 +32,14 @@ def plan_md(todos):
                      for t in todos)
 
 
+def line_for(ev):
+    return f"{LANE_ICON.get(ev['lane'], '🤖')} **{ev['lane']}** · `{ev['name']}` {json.dumps(ev['args'])[:100]}"
+
+
+# ---------------- sidebar ----------------
 with st.sidebar:
+    st.title("Ember")
+    st.caption("Fire readiness for commercial buildings. Scores are heuristic ESTIMATES, not a validated model.")
     hazard = st.selectbox("Hazard", list(HAZARDS), format_func=lambda k: HAZARDS[k]["label"])
     city = st.selectbox("City", ["Los Angeles", "Houston"])
     multi = st.checkbox("Include apartments", False)
@@ -30,82 +48,82 @@ with st.sidebar:
     st.write("Vexcel: **MOCK**" if MOCK else "Vexcel: live")
     if not LLM_MODEL:
         st.warning("LLM_MODEL not set in .env")
-    go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL))
+    go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL), width="stretch")
 
-if sel:
-    st.map([{"lat": sel["lat"], "lon": sel["lon"]}], zoom=14, height=250)
-    with st.spinner("Loading CoStar tenancy and sale data (first load is slow)..."):
-        stk = costar.get_stakes(sel["id"])
-    st.subheader("What's at stake (CoStar)")
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Current tenants", stk["tenant_count"])
-    c2.metric("Occupied sq ft", f"{stk['occupied_sqft']:,.0f}" if stk["occupied_sqft"] else "not recorded")
-    c3.metric("Employees (known)", stk["employees_known"] if stk["employees_known"] is not None else "not recorded",
-              help=f"CoStar has headcount for {stk['employees_known_for']}; the true total is higher or unknown.")
-    sale = stk["last_sale"]
-    if sale:
-        c4.metric("Last sale", f"${sale['price']:,.0f}" if sale["price"] else "price not recorded",
-                  help=f"{sale['date']}; price status: {sale['price_status']}" + ("; portfolio sale" if sale["portfolio_sale"] else ""))
-        c4.caption(f"{sale['date']} · {sale['price_status']}" + (" · portfolio" if sale["portfolio_sale"] else ""))
-    else:
-        c4.metric("Last sale", "none in CoStar kit")
-    if stk["tenants"]:
-        st.dataframe([{"Tenant": t["name"], "Employees": nr(t["employees"]), "Sq ft": nr(t["sqft"]),
-                       "Lease expires": nr(t["lease_expires"])} for t in stk["tenants"]],
-                     hide_index=True, width="stretch")
-    st.caption("Figures are as CoStar records them; 'not recorded' means CoStar has no value, not zero.")
+if not sel:
+    st.stop()
 
-# ---- run the agent (live), then store results so the page can re-render without losing them ----
+run = S.get("run")
+if run and run["bid"] != sel["id"]:
+    run = None  # a different building is selected: show it fresh
+
+
+def start_run():
+    r = {"bid": sel["id"], "hazard": hazard, "tid": uuid.uuid4().hex, "lanes": {}, "plan": [], "report": "",
+         "chat": [], "tokens": [0, 0], "pending": None, "apply": []}
+    r["agent"] = ag.build_agent(hazard, memory=True)
+    with st.status("Agent team working...", expanded=True) as status:
+        plan_box, log_box = st.empty(), st.container()
+        for ev in ag.stream_events(r["agent"], sel["id"], hazard, thread_id=r["tid"]):
+            if ev["type"] == "plan":
+                r["plan"] = ev["todos"]
+                plan_box.markdown("**Plan**\n" + plan_md(ev["todos"]))
+            elif ev["type"] == "tool_call" and ev["name"] != "write_todos":
+                r["lanes"].setdefault(ev["lane"], []).append(line_for(ev))
+                log_box.markdown(line_for(ev))
+            elif ev["type"] == "usage":
+                r["tokens"][0] += ev["input"]; r["tokens"][1] += ev["output"]
+            elif ev["type"] == "text":
+                r["report"] = ev["text"]
+        status.update(label="Done", state="complete", expanded=False)
+    OUT_DIR.mkdir(exist_ok=True)
+    (OUT_DIR / f"report_{sel['id']}.md").write_text(r["report"])
+    return r
+
+
 if go:
-    run = {"bid": sel["id"], "hazard": hazard, "tid": uuid.uuid4().hex, "log": [], "plan": [],
-           "images": None, "report": "", "chat": []}
     try:
-        run["agent"] = ag.build_agent(hazard, memory=True)
-        with st.status("Agent working...", expanded=True) as status:
-            plan_box, log_box = st.empty(), st.container()
-            for ev in ag.stream_events(run["agent"], sel["id"], hazard, thread_id=run["tid"]):
-                if ev["type"] == "plan":
-                    run["plan"] = ev["todos"]
-                    plan_box.markdown("**Plan**\n" + plan_md(ev["todos"]))
-                elif ev["type"] == "tool_call":
-                    if ev["name"] != "write_todos":
-                        run["log"].append(f"`{ev['name']}` {json.dumps(ev['args'])[:120]}")
-                        log_box.markdown("🔧 " + run["log"][-1])
-                elif ev["type"] == "tool_result" and ev["name"] == "get_interior":
-                    try:
-                        run["interior"] = json.loads(ev["content"])
-                    except Exception:
-                        pass
-                elif ev["type"] == "tool_result" and ev["name"] == "detect_hazard_features":
-                    try:
-                        run["images"] = json.loads(ev["content"])
-                    except Exception:
-                        pass
-                elif ev["type"] == "text":
-                    run["report"] = ev["text"]
-            status.update(label="Done", state="complete", expanded=False)
-        OUT_DIR.mkdir(exist_ok=True)
-        (OUT_DIR / f"report_{sel['id']}.md").write_text(run["report"])
-        S["run"] = run
+        S["run"] = run = start_run()
         st.rerun()
     except Exception as e:
         st.error(f"{type(e).__name__}: {e}")
 
-run = S.get("run")
-if sel and run and run["bid"] == sel["id"]:
-    bid = run["bid"]
-    facts = ag.get_facts(bid)
-    base = scoring.score(facts)
-    ranked = scoring.rank_fixes(facts)
+# agent actions that tick the checkboxes must be applied BEFORE the widgets are created
+if run and run["apply"]:
+    for fid in run["apply"]:
+        S[f"fix_{run['bid']}_{fid}"] = True
+    run["apply"] = []
 
-    st.divider()
-    left, right = st.columns([1, 2])
-    with right:
-        st.subheader("What-if: tick fixes to re-score")
-        chosen = []
+rail, main = st.columns([1, 2], gap="large")
+
+# ---------------- left rail: score + what-if (always visible) ----------------
+with rail:
+    if not run:
+        st.info("Pick a building and click **Investigate**. The score, fixes and budget planner appear here.")
+    else:
+        bid = run["bid"]
+        facts = ag.get_facts(bid)
+        base = scoring.score(facts)
+        ranked = scoring.rank_fixes(facts)
+        chosen = [r["id"] for r in ranked if S.get(f"fix_{bid}_{r['id']}")]
+        after = scoring.score(scoring.apply_fixes(facts, chosen))
+        st.metric("Fire-readiness score (ESTIMATE)", f"{after['score']} / 100",
+                  delta=f"{after['score'] - base['score']} pts vs. now" if chosen else None, delta_color="inverse")
+        z = facts.get("zone_hazard") or {}
+        if z.get("status") == "ok":
+            zone_txt = f"CAL FIRE zone: **{z['class']}**" if z.get("in_zone") else "outside CAL FIRE mapped zones (older maps)"
+        else:
+            zone_txt = "CAL FIRE zone: unavailable"
+        st.markdown(f"Band: **{after['band']}**" + (f" (now {base['score']}, {base['band']})" if chosen else "") + f"  \n{zone_txt}")
+        with st.expander("Factor breakdown"):
+            for f in after["factors"]:
+                st.caption(f"{f['label']}: {f['points']} pts")
+                st.progress(min(max(f["value"], 0.0), 1.0))
+            if after["missing"]:
+                st.caption("Not scored: " + ", ".join(m["factor"] for m in after["missing"]))
+        st.markdown("**What-if: tick fixes** (the agent can tick these too)")
         for r in ranked:
-            if st.checkbox(f"{r['label']} · cost {r['cost']} · −{r['points_removed']} pts alone", key=f"fix_{bid}_{r['id']}"):
-                chosen.append(r["id"])
+            st.checkbox(f"{r['label']} · cost {r['cost']} · −{r['points_removed']} pts alone", key=f"fix_{bid}_{r['id']}")
         if not ranked:
             st.info("No modelled fix changes this building's score.")
         with st.expander("Budget planner (you supply the costs; nothing is invented)"):
@@ -125,61 +143,158 @@ if sel and run and run["bid"] == sel["id"]:
                     st.warning("Nothing useful fits that budget with the costs given.")
                 if p["skipped_no_cost"]:
                     st.caption("Not considered (no cost given): " + ", ".join(p["skipped_no_cost"]))
-    after = scoring.score(scoring.apply_fixes(facts, chosen))
-    with left:
-        st.metric("Fire-readiness score (ESTIMATE)", f"{after['score']} / 100",
-                  delta=f"{after['score'] - base['score']} pts vs. now" if chosen else None, delta_color="inverse")
-        st.markdown(f"Band: **{after['band']}**" + (f" (now {base['score']}, {base['band']})" if chosen else ""))
-        for f in after["factors"]:
-            st.caption(f"{f['label']}: {f['points']} pts")
-            st.progress(min(max(f["value"], 0.0), 1.0))
-        if after["missing"]:
-            st.caption("Not scored: " + ", ".join(m["factor"] for m in after["missing"]))
 
-    img, rep = st.columns([1, 1])
-    with img:
-        if run["images"]:
-            st.image(run["images"]["annotated"], caption="Annotated aerial (Vexcel)")
-            for c in run["images"].get("crops", []):
-                st.image(c["path"], caption=f"{c['n']}: {c['label']}", width=150)
-    with rep:
-        st.markdown(run["report"])
-        st.caption(f"Saved to out/report_{bid}.md")
+# ---------------- right: tabs ----------------
+with main:
+    st.subheader(f"{sel['name']} · {sel['type']} · #{sel['id']}")
+    t_stakes, t_out, t_in, t_rep, t_team, t_ask = st.tabs(
+        ["Stakes", "Outside", "Inside", "Report", "Agent team", "Ask"])
 
-    inner = run.get("interior")
-    if inner and inner.get("status") == "ok":
-        st.subheader("Inside (Matterport)")
-        st.caption("A vision model reads these images. Observations are uncertain; 'not_seen' is not proof an item is "
-                   "absent. The sprinkler reading is unreliable and is not scored (CoStar is used for sprinklers).")
-        cols = st.columns(3)
-        for k, im in enumerate(inner["images"]):
-            with cols[k % 3]:
-                st.image(im["path"], caption=im["caption"])
-                st.link_button("Open 3D walkthrough", im["view_url"])
-        st.dataframe([{"Item": name.replace("_", " "), "Status": o["status"], "Note": o["note"]}
-                      for name, o in inner["observations"].items()], hide_index=True, width="stretch")
-    elif inner:
-        st.info(f"Interior step: {inner.get('status')} {inner.get('reason', '')}")
+    with t_stakes:
+        st.map([{"lat": sel["lat"], "lon": sel["lon"]}], zoom=14, height=220)
+        with st.spinner("Loading CoStar tenancy and sale data (first load is slow)..."):
+            stk = costar.get_stakes(sel["id"])
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Current tenants", stk["tenant_count"])
+        c2.metric("Occupied sq ft", f"{stk['occupied_sqft']:,.0f}" if stk["occupied_sqft"] else "not recorded")
+        c3.metric("Employees (known)", stk["employees_known"] if stk["employees_known"] is not None else "not recorded",
+                  help=f"CoStar has headcount for {stk['employees_known_for']}; the true total is higher or unknown.")
+        sale = stk["last_sale"]
+        if sale:
+            c4.metric("Last sale", f"${sale['price']:,.0f}" if sale["price"] else "price not recorded",
+                      help=f"{sale['date']}; price status: {sale['price_status']}" + ("; portfolio sale" if sale["portfolio_sale"] else ""))
+            c4.caption(f"{sale['date']} · {sale['price_status']}" + (" · portfolio" if sale["portfolio_sale"] else ""))
+        else:
+            c4.metric("Last sale", "none in CoStar kit")
+        cs = sustainability.carbon_at_stake(costar.get_property(sel["id"]).get("gba_sqft"))
+        st.markdown("#### Sustainability: embodied carbon at stake")
+        if cs:
+            st.metric("Upfront embodied carbon a rebuild would re-emit", f"{cs['tonnes_co2e']:,} t CO2e")
+            st.bar_chart(cs["by_scope_tonnes"], horizontal=True)
+            st.caption(cs["caveats"] + f" Source: {cs['basis']}: [CLF]({cs['source_url']}).")
+        else:
+            st.info("Gross building area not recorded in CoStar; carbon at stake not computed.")
+        if stk["tenants"]:
+            st.dataframe([{"Tenant": t["name"], "Employees": nr(t["employees"]), "Sq ft": nr(t["sqft"]),
+                           "Lease expires": nr(t["lease_expires"])} for t in stk["tenants"]],
+                         hide_index=True, width="stretch")
+        st.caption("Figures are as CoStar records them; 'not recorded' means CoStar has no value, not zero.")
 
-    with st.expander("Agent plan and tool log"):
-        st.markdown(plan_md(run["plan"]))
-        for line in run["log"]:
-            st.markdown("🔧 " + line)
+    view = ag.get_view(run["bid"]) if run else None
 
-    st.subheader("Ask the agent")
-    for role, text in run["chat"]:
-        st.chat_message(role).markdown(text)
-    if prompt := st.chat_input("Ask a follow-up, e.g. 'I have $5,000, what first?'"):
-        run["chat"].append(("user", prompt))
-        st.chat_message("user").markdown(prompt)
-        with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                ans = ""
-                try:
-                    for ev in ag.stream_events(run["agent"], bid, run["hazard"], user_msg=prompt, thread_id=run["tid"]):
-                        if ev["type"] == "text":
-                            ans = ev["text"]
-                except Exception as e:
-                    ans = f"{type(e).__name__}: {e}"
-            st.markdown(ans)
-        run["chat"].append(("assistant", ans))
+    with t_out:
+        if view and view["images"]:
+            st.image(view["images"]["annotated"], caption="Annotated aerial (Vexcel)")
+            cols = st.columns(4)
+            for k, c in enumerate(view["images"].get("crops", [])):
+                cols[k % 4].image(c["path"], caption=f"{c['n']}: {c['label']}")
+        else:
+            st.info("Run Investigate to see the aerial view.")
+
+    with t_in:
+        inner = view and view["interior"]
+        if inner and inner.get("status") == "ok":
+            st.caption("A vision model reads these images, then a second skeptical pass must confirm every 'seen' item "
+                       "(otherwise it is downgraded to cannot_tell). Observations are uncertain; 'not_seen' is not proof an "
+                       "item is absent. The sprinkler reading is unreliable and not scored (CoStar is used for sprinklers).")
+            cols = st.columns(3)
+            for k, im in enumerate(inner["images"]):
+                with cols[k % 3]:
+                    st.image(im["path"], caption=im["caption"])
+                    st.link_button("Open 3D walkthrough", im["view_url"])
+            st.dataframe([{"Item": n.replace("_", " "), "Final": o["status"], "First pass": o["first_pass"],
+                           "Second look": o["second_look"] or "-", "Note": o["note"]}
+                          for n, o in inner["observations"].items()], hide_index=True, width="stretch")
+        elif inner and inner.get("status") != "not_run":
+            st.info(f"Interior step: {inner.get('status')} {inner.get('reason', '')}")
+        else:
+            st.info("Run Investigate to see the interior reading.")
+
+    with t_rep:
+        if run and run["report"]:
+            st.markdown(run["report"])
+            st.download_button("Download report (.md)", run["report"], file_name=f"report_{run['bid']}.md")
+        else:
+            st.info("The agent's report appears here.")
+
+    with t_team:
+        if run:
+            cols = st.columns(4)
+            for col, lane in zip(cols, ["orchestrator", "exterior-analyst", "interior-inspector", "stakes-analyst"]):
+                with col:
+                    st.markdown(f"##### {LANE_ICON[lane]} {lane}")
+                    for line in run["lanes"].get(lane, []):
+                        st.markdown(line.split("·", 1)[1] if "·" in line else line)
+            st.markdown("**Plan**\n" + plan_md(run["plan"]))
+            st.caption(f"Tokens so far: {run['tokens'][0]:,} in / {run['tokens'][1]:,} out (all lanes).")
+        else:
+            st.info("Live lanes for the orchestrator and three specialist subagents appear after Investigate.")
+
+    with t_ask:
+        if not run:
+            st.info("Investigate first, then ask follow-ups or use the one-click jobs.")
+        else:
+            def ask(prompt, decisions=None):
+                """Send a follow-up (or resume after an approval) and render the answer."""
+                if decisions is None:
+                    run["chat"].append(("user", prompt))
+                    st.chat_message("user").markdown(prompt)
+                    events = ag.stream_events(run["agent"], run["bid"], run["hazard"], user_msg=prompt, thread_id=run["tid"])
+                else:
+                    events = ag.resume_events(run["agent"], decisions, run["tid"])
+                with st.chat_message("assistant"):
+                    ans = ""
+                    with st.spinner("Thinking..."):
+                        try:
+                            for ev in events:
+                                if ev["type"] == "text":
+                                    ans = ev["text"]
+                                elif ev["type"] == "usage":
+                                    run["tokens"][0] += ev["input"]; run["tokens"][1] += ev["output"]
+                                elif ev["type"] == "interrupt":
+                                    run["pending"] = ev["requests"]
+                                elif ev["type"] == "tool_call" and ev["name"] == "what_if":
+                                    run["apply"] += [i for i in (ev["args"] or {}).get("fix_ids", []) if i in scoring.FIXES]
+                                elif ev["type"] == "tool_result" and ev["name"] == "plan_budget":
+                                    try:
+                                        run["apply"] += json.loads(ev["content"]).get("fixes", [])
+                                    except Exception:
+                                        pass
+                        except Exception as e:
+                            ans = f"{type(e).__name__}: {e}"
+                    if ans:
+                        st.markdown(ans)
+                        run["chat"].append(("assistant", ans))
+                if run["apply"] or run["pending"]:
+                    st.rerun()
+
+            st.markdown("**One-click jobs**")
+            bcols = st.columns(len(QUICK))
+            queued = None
+            for col, (label, prompt) in zip(bcols, QUICK.items()):
+                if col.button(label, key=f"q_{label}", width="stretch"):
+                    queued = prompt
+
+            if run["pending"]:
+                st.warning("The agent wants to save this draft. Review it first.")
+                for req in run["pending"]:
+                    a = req.get("args", {})
+                    subj = st.text_input("Subject", a.get("subject", ""), key="ap_subj")
+                    body = st.text_area("Body", a.get("body", ""), height=200, key="ap_body")
+                    b1, _, b3 = st.columns(3)
+                    decision = None
+                    if b1.button("Approve (as shown)", type="primary", key="ap_ok"):
+                        edited = subj != a.get("subject", "") or body != a.get("body", "")
+                        decision = ({"type": "edit", "edited_action": {"name": req["name"], "args": {**a, "subject": subj, "body": body}}}
+                                    if edited else {"type": "approve"})
+                    if b3.button("Reject", key="ap_no"):
+                        decision = {"type": "reject", "message": "User rejected the draft."}
+                    if decision:
+                        run["pending"] = None
+                        ask(None, decisions=[decision])
+
+            for role, text in run["chat"]:
+                st.chat_message(role).markdown(text)
+            typed = st.chat_input("Ask a follow-up, e.g. 'what if I screen the vents and clear zone 1?'")
+            if queued or typed:
+                ask(queued or typed)

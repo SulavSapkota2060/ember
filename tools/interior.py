@@ -21,6 +21,60 @@ Reply with JSON only, no prose, exactly this shape:
 Use these item keys: {keys}."""
 
 
+CONFUSIONS = {
+    "fire_extinguisher": "a red box, hose reel, thermostat, speaker, heater or any other wall fixture",
+    "sprinkler_head": "an HVAC air diffuser/vent, speaker, light fixture, smoke detector or sensor",
+    "alarm_or_smoke_detector": "a thermostat, motion sensor, speaker, light or a generic ceiling disc",
+    "exit_sign": "any other sign or a light",
+    "blocked_egress": "furniture or equipment that does NOT actually obstruct the route",
+    "stored_combustibles": "ordinary furniture or fixtures that are not stored material",
+}
+VERIFY_PROMPT = """A first reviewer claims the items below are visible in these interior images. Be skeptical.
+Confirm an item ONLY if it is unambiguously that item and cannot reasonably be something else.
+Typical confusions: {conf}
+Claims:
+{claims}
+Reply with JSON only: {{"<item_key>": {{"verdict": "confirmed|not_confirmed", "reason": "short, factual"}}}}"""
+
+
+def _text(resp):
+    return resp.content if isinstance(resp.content, str) else "".join(
+        b.get("text", "") for b in resp.content if isinstance(b, dict))
+
+
+def verify(images: list[dict], result: dict) -> dict:
+    """Second, skeptical vision pass over every item the first pass called 'seen'. Anything not confirmed is
+    downgraded to cannot_tell, so a single misread (e.g. HVAC diffuser as sprinkler) cannot reach the score."""
+    seen = [k for k, v in result["obs"].items() if v == "seen"]
+    result["first_pass"] = dict(result["obs"])
+    result["second_look"] = {}
+    if not seen:
+        return result
+    from langchain.chat_models import init_chat_model
+    idx = sorted({n for k in seen for n in (result["images_for"].get(k) or []) if 1 <= n <= len(images)}) \
+        or list(range(1, len(images) + 1))
+    claims = "\n".join(f"- {k}: {result['notes'].get(k, '')} (first reviewer cited images {result['images_for'].get(k)})"
+                       for k in seen)
+    content = [{"type": "text", "text": VERIFY_PROMPT.format(
+        conf="; ".join(f"{k}: {CONFUSIONS[k]}" for k in seen), claims=claims)}]
+    for n in idx:
+        content.append({"type": "text", "text": f"Image {n}: {images[n - 1]['caption']}"})
+        content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _b64(images[n - 1]["path"])}})
+    txt = _text(init_chat_model(VISION_MODEL).invoke([{"role": "user", "content": content}]))
+    try:
+        verdicts = json.loads(txt[txt.index("{"): txt.rindex("}") + 1])
+    except Exception:
+        verdicts = {}
+    for k in seen:
+        v = verdicts.get(k) or {}
+        ok = v.get("verdict") == "confirmed"
+        result["second_look"][k] = {"verdict": "confirmed" if ok else "not_confirmed", "reason": str(v.get("reason", ""))[:160]}
+        if not ok:
+            result["obs"][k] = "cannot_tell"
+            result["notes"][k] = ("Second look could not confirm: " + (str(v.get("reason", "")) or "no reason given"))[:160]
+    return result
+
+
 def _b64(path):
     with open(path, "rb") as f:
         return base64.b64encode(f.read()).decode()
@@ -35,9 +89,7 @@ def analyze(images: list[dict]) -> dict:
     for n, im in enumerate(images, 1):
         content.append({"type": "text", "text": f"Image {n}: {im['caption']}"})
         content.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + _b64(im["path"])}})
-    resp = init_chat_model(VISION_MODEL).invoke([{"role": "user", "content": content}])
-    txt = resp.content if isinstance(resp.content, str) else "".join(
-        b.get("text", "") for b in resp.content if isinstance(b, dict))
+    txt = _text(init_chat_model(VISION_MODEL).invoke([{"role": "user", "content": content}]))
     obs = json.loads(txt[txt.index("{"): txt.rindex("}") + 1]).get("observations", {})
     out = {"obs": {}, "notes": {}, "images_for": {}, "n_images": len(images)}
     for k in ITEMS:
