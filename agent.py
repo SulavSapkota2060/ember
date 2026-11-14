@@ -1,15 +1,18 @@
-import json
+import json, threading
 from config import LLM_MODEL
 from hazards import HAZARDS
 from tools import costar, vexcel, hazard_zone, actions
 
-_cache = {}  # building_id -> {"prop":..., "elements":...}
+_cache = {}
+_lock = threading.Lock()
+_HAZARD = "wildfire"  # set by build_agent; tools read it so the LLM never passes it  # building_id -> {"prop":..., "elements":...}
 
 def _ctx(building_id):
     building_id = int(building_id)
-    if building_id not in _cache:
-        p = costar.get_property(building_id)
-        _cache[building_id] = {"prop": p, "el": vexcel.get_property_elements(p["lat"], p["lon"])}
+    with _lock:  # tools run in parallel threads; fetch each building once
+        if building_id not in _cache:
+            p = costar.get_property(building_id)
+            _cache[building_id] = {"prop": p, "el": vexcel.get_property_elements(p["lat"], p["lon"])}
     return _cache[building_id]
 
 # ---- agent tools (docstrings are what the LLM sees) ----
@@ -27,21 +30,21 @@ def get_aerial(building_id: int) -> str:
     c = _ctx(building_id)
     return vexcel.get_aerial(c["prop"]["lat"], c["prop"]["lon"], c["el"]["parcel_wkt"])
 
-def detect_hazard_features(building_id: int, hazard: str) -> str:
+def detect_hazard_features(building_id: int) -> str:
     """Run Vexcel open-vocabulary detection for hazard-relevant features on the aerial image, then produce
     an annotated image with numbered callouts plus a close-up crop per detection. Returns detections
     (n, label, confidence) and image paths. Use the callout numbers in your report."""
     c = _ctx(building_id)
     p, wkt = c["prop"], c["el"]["parcel_wkt"]
-    dets = vexcel.detect(p["lat"], p["lon"], HAZARDS[hazard]["detect_labels"], wkt)
+    dets = vexcel.detect(p["lat"], p["lon"], HAZARDS[_HAZARD]["detect_labels"], wkt)
     ann = vexcel.annotate(p["lat"], p["lon"], dets, wkt)
     slim = [{k: v for k, v in d.items() if k in ("n", "label", "confidence")} for d in dets]
     return json.dumps({"detections": slim, **ann})
 
-def get_hazard_zone(building_id: int, hazard: str) -> str:
+def get_hazard_zone(building_id: int) -> str:
     """Official hazard-zone lookup. May return status 'unavailable': then say so and score from imagery."""
     p = _ctx(building_id)["prop"]
-    return json.dumps(hazard_zone.get_hazard_zone(p["lat"], p["lon"], hazard))
+    return json.dumps(hazard_zone.get_hazard_zone(p["lat"], p["lon"], _HAZARD))
 
 def draft_action(building_id: int, subject: str, body: str) -> str:
     """Save a drafted action (e.g. contractor request email). Returns the file path."""
@@ -61,8 +64,12 @@ If a tool result says mock, state that."""
 def build_agent(hazard: str):
     if not LLM_MODEL:
         raise RuntimeError("LLM_MODEL not set in .env (format 'provider:model'). Provider undecided.")
+    global _HAZARD
+    _HAZARD = hazard
+    costar._props(); costar._models()  # warm the cache once, before parallel tool threads
     from deepagents import create_deep_agent
-    return create_deep_agent(model=LLM_MODEL, tools=TOOLS,
+    from langchain.agents.middleware import TodoListMiddleware  # not in deepagents 0.7.x defaults; powers the live plan
+    return create_deep_agent(model=LLM_MODEL, tools=TOOLS, middleware=[TodoListMiddleware()],
                              system_prompt=SYSTEM.format(hazard_prompt=HAZARDS[hazard]["prompt"]))
 
 def stream_events(agent, building_id: int, hazard: str, user_msg: str | None = None):
