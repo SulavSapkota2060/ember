@@ -1,6 +1,7 @@
 import json, threading
 from config import LLM_MODEL
 from hazards import HAZARDS
+import scoring
 from tools import costar, vexcel, hazard_zone, actions
 
 _cache = {}
@@ -38,8 +39,22 @@ def detect_hazard_features(building_id: int) -> str:
     p, wkt = c["prop"], c["el"]["parcel_wkt"]
     dets = vexcel.detect(p["lat"], p["lon"], HAZARDS[_HAZARD]["detect_labels"], wkt)
     ann = vexcel.annotate(p["lat"], p["lon"], dets, wkt)
+    c["dets"] = dets  # score_risk reads these
     slim = [{k: v for k, v in d.items() if k in ("n", "label", "confidence")} for d in dets]
     return json.dumps({"detections": slim, **ann})
+
+def score_risk(building_id: int) -> str:
+    """Compute the fire-readiness score with the project's rule-based heuristic (code, not your judgement).
+    Returns score 0-100, band, per-factor points with evidence, factors missing data, and ranked fixes
+    (each with score delta and relative cost). Call this AFTER detect_hazard_features so detections count.
+    Report this score exactly; never compute or adjust a score yourself."""
+    c = _ctx(building_id)
+    f = scoring.build_facts(c["prop"], c["el"]["attrs"], c.get("dets"))
+    c["facts"] = f
+    r = scoring.score(f)
+    r["ranked_fixes"] = scoring.rank_fixes(f)
+    r["detections_used"] = c.get("dets") is not None
+    return json.dumps(r)
 
 def get_hazard_zone(building_id: int) -> str:
     """Official hazard-zone lookup. May return status 'unavailable': then say so and score from imagery."""
@@ -50,16 +65,25 @@ def draft_action(building_id: int, subject: str, body: str) -> str:
     """Save a drafted action (e.g. contractor request email). Returns the file path."""
     return actions.write_action_draft(building_id, subject, body)
 
-TOOLS = [get_property, get_parcel_attributes, get_aerial, detect_hazard_features, get_hazard_zone, draft_action]
+TOOLS = [get_property, get_parcel_attributes, get_aerial, detect_hazard_features, get_hazard_zone,
+         score_risk, draft_action]
 
 SYSTEM = """You are Ember, a hazard-readiness analyst for commercial buildings.
 {hazard_prompt}
-Process: write a plan with the todo tool first, then gather data with tools, then report.
-Report format: (1) risk score 0-100 labelled ESTIMATE with 3-5 reasons that cite evidence (callout numbers,
-attribute values); (2) prioritized fix list with rough relative cost (low/med/high), no invented dollar figures
-unless the user gave a budget; (3) data gaps (e.g. hazard zone unavailable, mock data).
-The score is a transparent heuristic, not a validated model. Never invent data a tool did not return.
-If a tool result says mock, state that."""
+Process: write a plan with the todo tool first and update item statuses as you go. Gather data with the
+data tools (these can run together), then call detect_hazard_features, THEN score_risk (it needs the
+detections), then report.
+The score comes only from score_risk: report its number, band and factors exactly. Never compute, adjust or
+estimate a score yourself.
+Report format: (1) score 0-100 labelled ESTIMATE with 3-5 reasons that cite the evidence strings returned
+by score_risk (and callout numbers when relevant); (2) fix list taken from score_risk's ranked_fixes, with
+its score deltas and relative cost (low/med/high), no dollar figures unless the user gave a budget;
+(3) data gaps: list score_risk's `missing` factors, hazard zone unavailable, and mock data if any.
+Rules: the score is a transparent heuristic, not a validated model. Never invent data a tool did not
+return. Do not state distances or units for defensible-space zones (the data does not define them): say
+"zone 1 (nearest the building)" and quote the percentages as given. The roof condition value has an
+undocumented scale: do not interpret it. Images are shown to the user by the app; you cannot open image
+files, so do not try to read them. If a tool result says mock, state that."""
 
 def build_agent(hazard: str):
     if not LLM_MODEL:
