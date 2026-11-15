@@ -2,7 +2,6 @@ import json, os, threading, time, uuid
 import altair as alt
 import streamlit as st
 from config import MOCK, LLM_MODEL, OUT_DIR
-from hazards import HAZARDS
 from tools import costar
 import scoring
 import sustainability
@@ -89,12 +88,12 @@ def summary_card(bid, facts, ranked):
     inner = ag.get_view(bid)["interior"]
     z = facts.get("zone_hazard") or {}
     c1, c2, c3 = st.columns(3)
-    with c1.container(border=True):
+    with c1.container(border=True, height=230):
         st.markdown("**🛰️ Outside**")
         st.markdown(f"**{z['class'] + ' fire zone' if z.get('in_zone') else 'Outside mapped fire zone'}**" if z.get("status") == "ok" else "**Zone unavailable**")
         st.caption(f"Tree cover, zone 1: {facts.get('z1t')}%  \nRoof: {facts.get('roof_material') or 'unknown'}"
                    + (f"  \n{facts.get('roof_vents')} unscreened roof vents" if facts.get("roof_vents") else ""))
-    with c2.container(border=True):
+    with c2.container(border=True, height=230):
         st.markdown("**🏢 Inside**")
         if inner.get("status") == "ok":
             obs = inner["observations"]
@@ -104,7 +103,7 @@ def summary_card(bid, facts, ranked):
             st.caption(f"Seen: {', '.join(seen) or 'none'}  \nCan't tell: {', '.join(tell) or 'none'}")
         else:
             st.markdown("**Interior unavailable**")
-    with c3.container(border=True):
+    with c3.container(border=True, height=230):
         st.markdown("**👥 People and carbon**")
         emp = stk["employees_known"]
         st.markdown(f"**{stk['tenant_count']} tenants" + (f" · {emp:,}+ employees**" if emp else "**"))
@@ -116,9 +115,10 @@ def summary_card(bid, facts, ranked):
             y=alt.Y("fix:N", sort="-x", title=None),
             x=alt.X("points removed:Q", title="Exposure points removed by this fix alone"),
             color=alt.Color("carbon of the work:N", scale=alt.Scale(domain=["low", "med", "high"], range=[CARBON_COLOR["low"], CARBON_COLOR["med"], CARBON_COLOR["high"]]),
-                            legend=alt.Legend(orient="bottom", title="Carbon of the work (our heuristic)")),
-            tooltip=["fix", "points removed", "carbon of the work"]).properties(height=34 * len(top) + 130)
-        st.altair_chart(chart, width="stretch")
+                            legend=alt.Legend(title="Carbon of the work")),
+            tooltip=["fix", "points removed", "carbon of the work"])
+        st.altair_chart(chart, width="stretch", height=34 * len(top) + 60)
+        st.caption("Carbon tags are our heuristic (relative footprint of the work), not sourced figures.")
 
 
 
@@ -171,8 +171,8 @@ def line_for(ev):
 
 
 # ---------------- sidebar ----------------
-city_default, multi_default = "Los Angeles", False
-_blds_all = [b for b in costar.list_buildings(city_default, multi_default) if b["matterport"]]
+hazard = "wildfire"  # the only hazard that is built and scored
+_blds_all = [b for b in costar.list_buildings("Los Angeles", False) if b["matterport"]]
 if S.get("_goto"):  # set by the portfolio view; must be applied before the widgets below exist
     _b = next((b for b in _blds_all if b["id"] == S["_goto"]), None)
     if _b:
@@ -183,15 +183,11 @@ with st.sidebar:
     st.title("Ember")
     st.caption("Fire exposure for commercial buildings (lower is better). Scores are heuristic ESTIMATES, not a validated model.")
     view_mode = st.radio("View", ["Building", "Portfolio"], key="view", horizontal=True)
-    with st.expander("Options"):
-        hazard = st.selectbox("Hazard", list(HAZARDS), format_func=lambda k: HAZARDS[k]["label"])
-        city = st.selectbox("City", ["Los Angeles", "Houston"])
-        multi = st.checkbox("Include apartments", False)
-        deep = st.checkbox("Deep mode (LLM subagents + LLM reviewer, slower)", False,
-                           help="Default 'fast' mode runs the specialist workers in parallel and writes one short report; a code "
-                                "reviewer checks every number. Deep mode uses separate LLM subagents and an LLM reviewer (about "
-                                "50s).")
-    blds = [b for b in costar.list_buildings(city, multi) if b["matterport"]]
+    blds = _blds_all
+    deep = st.checkbox("Deep mode (LLM subagents + LLM reviewer, slower)", False,
+                       help="Default 'fast' mode runs the specialist workers in parallel and writes one short report; a code "
+                            "reviewer checks every number. Deep mode uses separate LLM subagents and an LLM reviewer (about "
+                            "50s).")
     sel = st.selectbox("Building", blds, key="bld_pick", format_func=lambda b: f"{b['name']} ({b['type']}) #{b['id']}")
     go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL) or view_mode == "Portfolio", width="stretch")
     st.caption(("Vexcel: MOCK" if MOCK else "Vexcel: live") + (" · Deep mode" if deep else " · Fast mode"))
@@ -221,7 +217,7 @@ if view_mode == "Portfolio":
         x=alt.X("screening_score:Q", title="Screening exposure (0-100, lower is better)"),
         y=alt.Y("carbon_t:Q", scale=alt.Scale(type="log"), title="Embodied carbon at stake (t CO2e, log scale)"),
         size=alt.Size("people:Q", legend=None, scale=alt.Scale(range=[40, 700])),
-        color=(alt.Color("ces_pctile:Q", title="Neighborhood burden percentile", scale=alt.Scale(scheme="orangered", domain=[0, 100]))
+        color=(alt.Color("ces_pctile:Q", title="Burden percentile", scale=alt.Scale(scheme="orangered", domain=[0, 100]))
                if by_burden else
                alt.Color("zone:N", title="CAL FIRE zone", scale=alt.Scale(domain=["Very High", "High", "Moderate", "none", "unknown"],
                          range=["#d62728", "#ff7f0e", "#f2c200", "#8a8f98", "#cccccc"]))),

@@ -1,5 +1,5 @@
 """Vexcel API 2.0 wrappers. Endpoints/params follow Vexcel_API_Hackathon_Tutorial.pdf.
-Real-mode code is UNTESTED until the key is exercised. MOCK mode uses fixtures + a generated image."""
+Real mode calls the live Vexcel API (property/extract, ortho, sam3 detect); MOCK mode uses fixtures + a generated image."""
 import json, random, time, hashlib
 import requests
 from PIL import Image, ImageDraw
