@@ -84,3 +84,13 @@ hi = sc.carbon_smart([{"id": "replace_roof", "label": "r", "cost": "high", "carb
                       {"id": "screen_vents", "label": "v", "cost": "low", "carbon": "low", "points_removed": 2}])
 assert hi[0]["id"] == "screen_vents" and hi[1]["low_payoff"] and not hi[0]["low_payoff"]
 print("carbon-smart tests passed")
+
+
+# ---- planner must consider fixes that only help in combination (a cap hides them when applied alone) ----
+dense = dict(f, z1t=80, z2t=80, z3t=80)
+assert "thin_zone2" not in {r["id"] for r in sc.rank_fixes(dense)}, "alone it changes nothing"
+plan = sc.plan_within_budget(dense, 10000, {"clear_zone1": 2500, "thin_zone2": 1500})
+assert set(plan["fixes"]) == {"clear_zone1", "thin_zone2"}, plan
+assert plan["after"] < sc.plan_within_budget(dense, 10000, {"clear_zone1": 2500})["after"]
+assert plan["cost"] <= 10000
+print("planner combination tests passed")

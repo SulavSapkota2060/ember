@@ -4,7 +4,7 @@ Pure Python, no LLM, no network. The agent calls this; the UI toggles call it di
 Score 0-100, higher = more exposed. Each factor is 0..1 and weighted. Factors with no data
 are dropped and the remaining weights renormalized (and listed in `missing`).
 
-Everything marked HEURISTIC below is my own starting guess and should be tuned on real buildings.
+Everything marked HEURISTIC below is a starting guess and should be tuned on real buildings.
 Vexcel `roof-characteristics.condition` is NOT used: its scale/direction is undocumented.
 Zone distances are NOT stated anywhere in the data, so evidence strings never quote feet.
 """
@@ -327,11 +327,20 @@ def carbon_smart(rows: list[dict]) -> list[dict]:
     return out
 
 
+def _useful_fixes(facts: dict) -> list[str]:
+    """Fixes that change the facts AND contribute to the score when everything is applied together. A fix can look
+    useless alone (a cap hides it) yet help in combination, so the planner must not rely on single-fix scores."""
+    applicable = [fid for fid in FIXES if apply_fixes(facts, [fid]) != facts]
+    full = score(apply_fixes(facts, applicable))["score"]
+    return [fid for fid in applicable if score(apply_fixes(facts, [x for x in applicable if x != fid]))["score"] > full]
+
+
 def plan_within_budget(facts: dict, budget: float, cost_usd: dict) -> dict:
     """Best set of fixes within `budget`. `cost_usd` maps fix id -> dollars, supplied by the user
     (we never invent prices). Exhaustive over useful fixes with a known cost (small set)."""
     base = score(facts)["score"]
-    cand = [r["id"] for r in rank_fixes(facts) if r["id"] in cost_usd]
+    useful = _useful_fixes(facts)
+    cand = [fid for fid in useful if fid in cost_usd]
     best = {"fixes": [], "cost": 0.0, "after": base}
     for k in range(1, len(cand) + 1):
         for combo in itertools.combinations(cand, k):
@@ -342,5 +351,5 @@ def plan_within_budget(facts: dict, budget: float, cost_usd: dict) -> dict:
             if after < best["after"] or (after == best["after"] and c < best["cost"] and combo):
                 best = {"fixes": list(combo), "cost": c, "after": after}
     best["before"] = base
-    best["skipped_no_cost"] = [r["id"] for r in rank_fixes(facts) if r["id"] not in cost_usd]
+    best["skipped_no_cost"] = [fid for fid in useful if fid not in cost_usd]
     return best

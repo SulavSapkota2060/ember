@@ -34,6 +34,10 @@ def nr(v):
     return "not recorded" if v is None else (f"{v:,.0f}" if isinstance(v, float) else str(v))
 
 
+def money(v):
+    return f"${v / 1e6:,.1f}M" if v >= 1e6 else f"${v / 1e3:,.0f}K" if v >= 1e3 else f"${v:,.0f}"
+
+
 def plan_md(todos):
     return "\n".join(f"- {'✅' if t.get('status')=='completed' else '🔄' if t.get('status')=='in_progress' else '⬜'} {t.get('content')}"
                      for t in todos)
@@ -112,8 +116,8 @@ def summary_card(bid, facts, ranked):
             y=alt.Y("fix:N", sort="-x", title=None),
             x=alt.X("points removed:Q", title="Exposure points removed by this fix alone"),
             color=alt.Color("carbon of the work:N", scale=alt.Scale(domain=["low", "med", "high"], range=[CARBON_COLOR["low"], CARBON_COLOR["med"], CARBON_COLOR["high"]]),
-                            legend=alt.Legend(orient="bottom", title="Carbon of doing the work (our heuristic)")),
-            tooltip=["fix", "points removed", "carbon of the work"]).properties(height=34 * len(top) + 30)
+                            legend=alt.Legend(orient="bottom", title="Carbon of the work (our heuristic)")),
+            tooltip=["fix", "points removed", "carbon of the work"]).properties(height=34 * len(top) + 130)
         st.altair_chart(chart, width="stretch")
 
 
@@ -149,6 +153,8 @@ def flow_dot(run):
             extra.append(verdict[n])
         if n in tok:
             extra.append(f"{(tok[n][0] + tok[n][1]) / 1000:.1f}k tokens")
+        if not run.get("deep") and n != "orchestrator":
+            extra.insert(0, "code check, no LLM" if n == "reviewer" else "code worker, no LLM")
         label = n + ("\\n" + " · ".join(extra) if extra else "")
         lines.append(f'"{n}" [label="{label}", fillcolor="{NODE_COLOR.get(n, "#5d6d7e")}"];')
     for h in hs:
@@ -177,19 +183,20 @@ with st.sidebar:
     st.title("Ember")
     st.caption("Fire exposure for commercial buildings (lower is better). Scores are heuristic ESTIMATES, not a validated model.")
     view_mode = st.radio("View", ["Building", "Portfolio"], key="view", horizontal=True)
-    hazard = st.selectbox("Hazard", list(HAZARDS), format_func=lambda k: HAZARDS[k]["label"])
-    city = st.selectbox("City", ["Los Angeles", "Houston"])
-    multi = st.checkbox("Include apartments", False)
+    with st.expander("Options"):
+        hazard = st.selectbox("Hazard", list(HAZARDS), format_func=lambda k: HAZARDS[k]["label"])
+        city = st.selectbox("City", ["Los Angeles", "Houston"])
+        multi = st.checkbox("Include apartments", False)
+        deep = st.checkbox("Deep mode (LLM subagents + LLM reviewer, slower)", False,
+                           help="Default 'fast' mode runs the specialist workers in parallel and writes one short report; a code "
+                                "reviewer checks every number. Deep mode uses separate LLM subagents and an LLM reviewer (about "
+                                "50s).")
     blds = [b for b in costar.list_buildings(city, multi) if b["matterport"]]
     sel = st.selectbox("Building", blds, key="bld_pick", format_func=lambda b: f"{b['name']} ({b['type']}) #{b['id']}")
-    st.write("Vexcel: **MOCK**" if MOCK else "Vexcel: live")
+    go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL) or view_mode == "Portfolio", width="stretch")
+    st.caption(("Vexcel: MOCK" if MOCK else "Vexcel: live") + (" · Deep mode" if deep else " · Fast mode"))
     if not LLM_MODEL:
         st.warning("LLM_MODEL not set in .env")
-    deep = st.checkbox("Deep mode (LLM subagents + LLM reviewer, slower)", False,
-                       help="Default 'fast' mode runs the specialist workers in parallel and writes one short report; a code "
-                            "reviewer checks every number. Deep mode uses separate LLM subagents and an LLM reviewer (about "
-                            "50s).")
-    go = st.button("Investigate", type="primary", disabled=not (sel and LLM_MODEL) or view_mode == "Portfolio", width="stretch")
 
 if view_mode == "Portfolio":
     st.subheader("Portfolio: where would retrofit money protect the most?")
@@ -324,7 +331,7 @@ if run and run["apply"]:
         S[f"fix_{run['bid']}_{fid}"] = True
     run["apply"] = []
 
-rail, main = st.columns([1, 2], gap="large")
+rail, main = st.columns([1, 2], gap="large") if run else (st.container(), st.container())
 
 # ---------------- left rail: score + what-if (always visible) ----------------
 with rail:
@@ -412,8 +419,8 @@ with main:
                   help=f"CoStar has headcount for {stk['employees_known_for']}; the true total is higher or unknown.")
         sale = stk["last_sale"]
         if sale:
-            c4.metric("Last sale", f"${sale['price']:,.0f}" if sale["price"] else "price not recorded",
-                      help=f"{sale['date']}; price status: {sale['price_status']}" + ("; portfolio sale" if sale["portfolio_sale"] else ""))
+            c4.metric("Last sale", money(sale["price"]) if sale["price"] else "price not recorded",
+                      help=f"{sale['date']}; exact price ${sale['price'] or 0:,.0f}; price status: {sale['price_status']}" + ("; portfolio sale" if sale["portfolio_sale"] else ""))
             c4.caption(f"{sale['date']} · {sale['price_status']}" + (" · portfolio" if sale["portfolio_sale"] else ""))
         else:
             c4.metric("Last sale", "none in CoStar kit")
@@ -589,12 +596,12 @@ with main:
                     st.rerun()
 
             st.markdown("**One-click jobs**")
-            bcols = st.columns(len(QUICK) + 1)
+            bcols = st.columns(3) + st.columns(3)
             queued = None
             for col, (label, prompt) in zip(bcols, QUICK.items()):
                 if col.button(label, key=f"q_{label}", width="stretch"):
                     queued = prompt
-            if bcols[-1].button("Stress-test the reviewer", key="q_stress", width="stretch",
+            if bcols[len(QUICK)].button("Stress-test the reviewer", key="q_stress", width="stretch",
                                 help="Plants errors on purpose to show the reviewer catching them. A test, not a real finding."):
                 if run.get("deep"):
                     queued = STRESS_LLM
