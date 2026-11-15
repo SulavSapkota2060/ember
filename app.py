@@ -630,6 +630,7 @@ with main:
                     if decision:
                         run["pending"] = None
                         ask(None, decisions=[decision])
+                        st.rerun()  # the answer is now in the chat history; redraw so it is not shown twice
 
             for role, text in run["chat"]:
                 st.chat_message(role).markdown(text)
