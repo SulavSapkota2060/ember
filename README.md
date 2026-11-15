@@ -48,7 +48,7 @@ the API's reasoning summaries) and tokens per agent.
 In both modes **the score is computed by code, never by the LLM.** Drafts (e.g. a contractor email) pass a **human approval gate**
 (approve / edit / reject) before anything is saved.
 
-## Data and limits (read this)
+## Data and limits
 - CAL FIRE zone lookup uses the public statewide service, whose local-area map is from 2011 (older than CAL FIRE's newer
   recommendations); "outside the mapped zones" is not proof of low hazard. Only 1 of the 138 LA buildings in the portfolio view
   (152 screened; 138 had usable Vexcel data) is inside a mapped zone.
