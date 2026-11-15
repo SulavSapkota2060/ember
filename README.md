@@ -24,6 +24,12 @@ tenant displacement and rebuilding, and a rebuild re-emits the upfront embodied 
 - **Equity lens:** the neighborhood's pollution-and-vulnerability burden (OEHHA CalEnviroScreen 4.0, census-tract percentile,
   looked up by coordinates). It is shown beside the exposure score and in the portfolio view as context. It is **not** a fire
   metric, describes the tract and not the building's tenants, and is **not part of the score**.
+- **Portfolio:** 138 LA buildings with Matterport models, plotted by a **screening** exposure score (outside data only: tree
+  cover by zone, roof material, CoStar sprinklers/construction, CAL FIRE zone) against embodied carbon at stake. Dot size is known
+  employees (CoStar), colour is neighborhood burden or CAL FIRE zone, and the dashed lines are portfolio medians, not danger
+  thresholds. The screening score is rougher than a full investigation (it has no detections, vents or interior; it ran 1-9 points
+  lower on the 4 buildings we compared) and is labelled as such. Building data comes from `scripts/screen_la.py` and
+  `scripts/build_portfolio.py` (output goes to the ignored `out/` folder).
 - **Interact:** left rail with the live score and fix checkboxes (instant re-score, no LLM call), a budget planner that only
   uses costs *you* enter, one-click agent jobs, and a follow-up chat. The agent can tick the fixes on screen.
 
@@ -44,8 +50,8 @@ In both modes **the score is computed by code, never by the LLM.** Drafts (e.g. 
 
 ## Data and limits (read this)
 - CAL FIRE zone lookup uses the public statewide service, whose local-area map is from 2011 (older than CAL FIRE's newer
-  recommendations); "outside the mapped zones" is not proof of low hazard. Only 1 of the 152 LA buildings we screened with
-  Matterport models is inside a mapped zone.
+  recommendations); "outside the mapped zones" is not proof of low hazard. Only 1 of the 138 LA buildings in the portfolio view
+  (152 screened; 138 had usable Vexcel data) is inside a mapped zone.
 - Vexcel's roof "condition" scale is undocumented, so it is not scored. Defensible-space zone distances are not documented,
   so none are stated.
 - CoStar fields are often blank; blanks are shown as "not recorded", never estimated.
@@ -57,8 +63,12 @@ In both modes **the score is computed by code, never by the LLM.** Drafts (e.g. 
 catalog (`scoring.py`), the agent design in both modes, the parallel workers, the number-checking reviewer and its tests (`agent.py`,
 `review.py`), the Haiku-then-Sonnet interior reading with a second look (`tools/interior.py`), the carbon-at-stake calculation
 (`sustainability.py`), the equity lens (`equity.py`), the portfolio view (`portfolio.py`) and the Streamlit interface (`app.py`).
-**Used, not written by us:** the libraries, models and datasets credited below. Developed with Claude Code (Anthropic) under the
-author's direction; the author is responsible for the design decisions described here.
+**Used, not written by us:** the libraries, models and datasets credited below.
+
+**AI assistance:** this project was built with the help of Claude Code (Anthropic's AI coding assistant), working from the author's
+direction. The problem, data sources, scoring factors and agent design were the author's choices, and the author takes responsibility
+for the design decisions described here. The product also uses Claude models at run time (the agents and the interior image reading),
+as credited below.
 
 ## Sources and credits
 **Data**
@@ -81,10 +91,14 @@ author's direction; the author is responsible for the design decisions described
   the four listed scopes.
 
 **Software and models**
-- [LangChain deepagents](https://github.com/langchain-ai/deepagents), LangChain and LangGraph (agents, subagents, planning,
-  human-in-the-loop approvals); `langchain-anthropic`.
-- Anthropic Claude models (Sonnet 5.5 and Haiku 5.5) for the agents and the interior image reading.
-- Streamlit, Altair, pandas, Pillow, Requests, python-dotenv and Shapely.
+- [LangChain deepagents](https://github.com/langchain-ai/deepagents) 0.7.38 (agents, subagents, planning, human-in-the-loop
+  approvals), [LangChain](https://github.com/langchain-ai/langchain) 1.5.0 (`langchain-anthropic` 1.7.10, agent middleware) and
+  [LangGraph](https://github.com/langchain-ai/langgraph) 1.2.22 (checkpointer and interrupts). Versions are the ones we ran.
+- [Anthropic](https://www.anthropic.com) Claude models (Sonnet 5.5 and Haiku 5.5) for the agents and the interior image reading.
+- [Streamlit](https://streamlit.io) 1.67 (interface and Graphviz rendering), [Altair](https://altair-viz.github.io) /
+  [Vega-Lite](https://vega.github.io/vega-lite/) (charts), [pandas](https://pandas.pydata.org), [Pillow](https://python-pillow.org),
+  [Requests](https://requests.readthedocs.io), [python-dotenv](https://github.com/theskumar/python-dotenv) and
+  [Shapely](https://shapely.readthedocs.io). Each is used under its own license; none is modified or redistributed here.
 
 Names of companies and agencies are used only to attribute data. This project is not affiliated with or endorsed by CoStar, Vexcel,
 Matterport, CAL FIRE, OEHHA, the Carbon Leadership Forum, Anthropic or LangChain.
@@ -99,4 +113,4 @@ Set `LLM_MODEL=anthropic:claude-sonnet-5-5` (provider:model). Optional: `LIGHT_M
 Vexcel runs in MOCK mode (fixtures) until `VEXCEL_API_KEY` is set. CoStar kit path: `COSTAR_KIT_DIR`
 (default `../data/costar-hackathon-kit`).
 
-Tests: `python -I tests/test_scoring.py`. Headless agent run: `python scripts/run_team.py BUILDING_ID`.
+Tests (plain asserts, no network): `python -I tests/test_scoring.py`, `tests/test_review.py` and `tests/test_equity.py`. Headless agent run: `python scripts/run_team.py BUILDING_ID`.
